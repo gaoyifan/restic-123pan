@@ -454,11 +454,14 @@ fn test_server_startup() {
 
 /// Create test files of a specific total size using truly random, incompressible data.
 /// Generates a mix of small, medium, and large files to simulate real workloads.
+/// Uses /dev/urandom for fast random data generation.
 fn create_large_test_files(dir: &PathBuf, total_size_mb: usize) {
-    use rand::Rng;
-    use std::io::BufWriter;
+    use std::io::{BufWriter, Read};
     
-    let mut rng = rand::thread_rng();
+    // Open /dev/urandom for fast random data reading
+    let mut urandom = fs::File::open("/dev/urandom")
+        .expect("Failed to open /dev/urandom");
+    
     let total_bytes = total_size_mb * 1024 * 1024;
     let mut created_bytes = 0usize;
     let mut file_counter = 0usize;
@@ -497,8 +500,9 @@ fn create_large_test_files(dir: &PathBuf, total_size_mb: usize) {
         let mut written = 0usize;
         while written < file_size {
             let to_write = (file_size - written).min(chunk_size);
-            // Generate truly random bytes (incompressible)
-            let random_chunk: Vec<u8> = (0..to_write).map(|_| rng.gen()).collect();
+            // Read random bytes from /dev/urandom (much faster than generating)
+            let mut random_chunk = vec![0u8; to_write];
+            urandom.read_exact(&mut random_chunk).expect("Failed to read from /dev/urandom");
             writer.write_all(&random_chunk).expect("Failed to write");
             written += to_write;
         }
@@ -523,7 +527,8 @@ fn create_large_test_files(dir: &PathBuf, total_size_mb: usize) {
         let mut written = 0usize;
         while written < file_size {
             let to_write = (file_size - written).min(chunk_size);
-            let random_chunk: Vec<u8> = (0..to_write).map(|_| rng.gen()).collect();
+            let mut random_chunk = vec![0u8; to_write];
+            urandom.read_exact(&mut random_chunk).expect("Failed to read from /dev/urandom");
             writer.write_all(&random_chunk).expect("Failed to write");
             written += to_write;
         }
@@ -544,8 +549,9 @@ fn create_large_test_files(dir: &PathBuf, total_size_mb: usize) {
         let path = small_dir.join(format!("small_{:04}.bin", file_counter));
         let mut file = fs::File::create(&path).expect("Failed to create small file");
         
-        // Random bytes for small files too
-        let random_data: Vec<u8> = (0..file_size).map(|_| rng.gen()).collect();
+        // Read random bytes from /dev/urandom for small files too
+        let mut random_data = vec![0u8; file_size];
+        urandom.read_exact(&mut random_data).expect("Failed to read from /dev/urandom");
         file.write_all(&random_data).expect("Failed to write");
         
         small_created += file_size;

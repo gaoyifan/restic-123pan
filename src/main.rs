@@ -3,19 +3,14 @@
 //! This server implements the Restic REST backend protocol and uses
 //! 123pan as the underlying storage provider.
 
-mod config;
-mod error;
-mod pan123;
-mod restic;
-
 use clap::Parser;
 use std::net::SocketAddr;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use crate::config::Config;
-use crate::pan123::Pan123Client;
-use crate::restic::create_router;
+use restic_api_server_123pan::config::Config;
+use restic_api_server_123pan::pan123::Pan123Client;
+use restic_api_server_123pan::restic::create_router;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

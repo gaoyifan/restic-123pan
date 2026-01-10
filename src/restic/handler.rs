@@ -325,7 +325,7 @@ async fn delete_file(
     
     // Idempotent: return OK even if file doesn't exist
     if let Some(file) = state.client.get_file_info(dir_id, &name).await? {
-        state.client.delete_file(file.file_id).await?;
+        state.client.delete_file(dir_id, file.file_id).await?;
     }
 
     Ok(StatusCode::OK)

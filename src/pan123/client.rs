@@ -17,6 +17,8 @@ pub struct Pan123Client {
     repo_path: String,
     /// Cache of directory IDs: path -> file_id
     dir_cache: Arc<RwLock<HashMap<String, i64>>>,
+    /// Cache of file listings: parent_id -> Vec<FileInfo>
+    files_cache: Arc<RwLock<HashMap<i64, Vec<FileInfo>>>>,
     /// Upload domain (fetched dynamically)
     upload_domain: Arc<RwLock<Option<String>>>,
 }
@@ -28,6 +30,7 @@ impl Pan123Client {
             token_manager: TokenManager::new(client_id, client_secret),
             repo_path,
             dir_cache: Arc::new(RwLock::new(HashMap::new())),
+            files_cache: Arc::new(RwLock::new(HashMap::new())),
             upload_domain: Arc::new(RwLock::new(None)),
         }
     }
@@ -130,7 +133,31 @@ impl Pan123Client {
     // ========================================================================
 
     /// List files in a directory.
+    /// Uses cache if available; otherwise fetches from API and caches the result.
     pub async fn list_files(&self, parent_id: i64) -> Result<Vec<FileInfo>> {
+        // Check cache first
+        {
+            let cache = self.files_cache.read();
+            if let Some(files) = cache.get(&parent_id) {
+                tracing::debug!("Cache hit for parent_id {}: {} files", parent_id, files.len());
+                return Ok(files.clone());
+            }
+        }
+
+        tracing::debug!("Cache miss for parent_id {}, fetching from API", parent_id);
+        let files = self.fetch_files_from_api(parent_id).await?;
+
+        // Store in cache
+        {
+            let mut cache = self.files_cache.write();
+            cache.insert(parent_id, files.clone());
+        }
+
+        Ok(files)
+    }
+
+    /// Fetch files from 123pan API (internal, bypasses cache).
+    async fn fetch_files_from_api(&self, parent_id: i64) -> Result<Vec<FileInfo>> {
         let mut all_files = Vec::new();
         let mut last_file_id: Option<i64> = None;
 
@@ -173,6 +200,14 @@ impl Pan123Client {
         Ok(all_files)
     }
 
+    /// Invalidate the files cache for a specific directory.
+    /// Call this when external changes may have occurred.
+    pub fn invalidate_files_cache(&self, parent_id: i64) {
+        let mut cache = self.files_cache.write();
+        cache.remove(&parent_id);
+        tracing::debug!("Invalidated files cache for parent_id {}", parent_id);
+    }
+
     /// Find a file by exact name in a directory.
     /// Uses directory listing instead of search (search has index delay issues).
     pub async fn find_file(&self, parent_id: i64, name: &str) -> Result<Option<FileInfo>> {
@@ -200,6 +235,8 @@ impl Pan123Client {
             // Code 1: directory already exists (message: 该目录下已经有同名文件夹,无法进行创建)
             if response.code == 1 && response.message.contains("同名") {
                 tracing::debug!("Directory '{}' already exists, looking up its ID via list_files", name);
+                // Invalidate cache first since it might be stale
+                self.invalidate_files_cache(parent_id);
                 // Search mode has index delay, use list_files instead
                 let files = self.list_files(parent_id).await?;
                 if let Some(file) = files.into_iter().find(|f| f.filename == name && f.is_folder()) {
@@ -218,6 +255,23 @@ impl Pan123Client {
         let data = response.data.ok_or_else(|| {
             AppError::Internal("No data in mkdir response".to_string())
         })?;
+
+        // Add newly created directory to cache if cache exists
+        {
+            let mut cache = self.files_cache.write();
+            if let Some(files) = cache.get_mut(&parent_id) {
+                let new_dir = FileInfo {
+                    file_id: data.dir_id,
+                    filename: name.to_string(),
+                    file_type: 1, // 1 = folder
+                    size: 0,
+                    parent_file_id: parent_id,
+                    trashed: 0,
+                };
+                files.push(new_dir);
+                tracing::debug!("Added new directory '{}' to cache (id={})", name, data.dir_id);
+            }
+        }
 
         tracing::info!("Created directory '{}' with id {}", name, data.dir_id);
         Ok(data.dir_id)
@@ -348,13 +402,15 @@ impl Pan123Client {
 
     /// Upload a file using single-step upload (for files <= 1GB).
     /// Uses duplicate=2 to overwrite existing files atomically.
+    /// Updates the files cache if it exists for the parent directory.
     pub async fn upload_file(
         &self,
         parent_id: i64,
         filename: &str,
         data: Bytes,
     ) -> Result<i64> {
-        tracing::debug!("Uploading file '{}' ({} bytes) to parent {}", filename, data.len(), parent_id);
+        let file_size = data.len() as i64;
+        tracing::debug!("Uploading file '{}' ({} bytes) to parent {}", filename, file_size, parent_id);
 
         // Calculate MD5 hash
         let md5_hash = format!("{:x}", md5::compute(&data));
@@ -367,7 +423,7 @@ impl Pan123Client {
             .text("parentFileID", parent_id.to_string())
             .text("filename", filename.to_string())
             .text("etag", md5_hash)
-            .text("size", data.len().to_string())
+            .text("size", file_size.to_string())
             .text("duplicate", "2") // Overwrite existing file atomically
             .part("file", Part::bytes(data.to_vec()).file_name(filename.to_string()));
 
@@ -403,8 +459,36 @@ impl Pan123Client {
             return Err(AppError::Internal("Upload not completed".to_string()));
         }
 
-        tracing::info!("Uploaded file '{}' with id {}", filename, upload_data.file_id);
-        Ok(upload_data.file_id)
+        let file_id = upload_data.file_id;
+
+        // Update files cache if it exists (Strategy A: only update if cache is initialized)
+        {
+            let mut cache = self.files_cache.write();
+            if let Some(files) = cache.get_mut(&parent_id) {
+                // Check if file already exists (overwrite case)
+                if let Some(existing) = files.iter_mut().find(|f| f.filename == filename) {
+                    // Update existing entry
+                    existing.file_id = file_id;
+                    existing.size = file_size;
+                    tracing::debug!("Updated existing file '{}' in cache (id={}, size={})", filename, file_id, file_size);
+                } else {
+                    // Add new entry
+                    let new_file = FileInfo {
+                        file_id,
+                        filename: filename.to_string(),
+                        file_type: 0, // 0 = file
+                        size: file_size,
+                        parent_file_id: parent_id,
+                        trashed: 0,
+                    };
+                    files.push(new_file);
+                    tracing::debug!("Added new file '{}' to cache (id={}, size={})", filename, file_id, file_size);
+                }
+            }
+        }
+
+        tracing::info!("Uploaded file '{}' with id {}", filename, file_id);
+        Ok(file_id)
     }
 
     /// Get download URL for a file.
@@ -476,8 +560,9 @@ impl Pan123Client {
     }
 
     /// Permanently delete a file (must be in trash first).
-    pub async fn delete_file(&self, file_id: i64) -> Result<()> {
-        tracing::debug!("Permanently deleting file {}", file_id);
+    /// Updates the files cache if it exists for the parent directory.
+    pub async fn delete_file(&self, parent_id: i64, file_id: i64) -> Result<()> {
+        tracing::debug!("Permanently deleting file {} from parent {}", file_id, parent_id);
 
         // First move to trash
         self.trash_file(file_id).await?;
@@ -496,6 +581,18 @@ impl Pan123Client {
                 code: response.code,
                 message: response.message,
             });
+        }
+
+        // Remove from files cache if it exists
+        {
+            let mut cache = self.files_cache.write();
+            if let Some(files) = cache.get_mut(&parent_id) {
+                let original_len = files.len();
+                files.retain(|f| f.file_id != file_id);
+                if files.len() < original_len {
+                    tracing::debug!("Removed file {} from cache for parent {}", file_id, parent_id);
+                }
+            }
         }
 
         tracing::info!("Deleted file {}", file_id);

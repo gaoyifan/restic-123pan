@@ -1,5 +1,5 @@
 # Multi-stage build for optimized Rust binary
-FROM rust:1.83-slim AS builder
+FROM rust:1.92-slim AS builder
 
 # Install build dependencies (perl needed for vendored OpenSSL build)
 RUN apt-get update && apt-get install -y \

@@ -1,0 +1,21 @@
+services:
+  restic-api-server-123pan:
+    build:
+      context: .
+    image: restic-api-server-123pan:latest
+    container_name: restic-api-server-123pan
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - PAN123_CLIENT_ID=${PAN123_CLIENT_ID}
+      - PAN123_CLIENT_SECRET=${PAN123_CLIENT_SECRET}
+      - PAN123_REPO_PATH=${PAN123_REPO_PATH:-/restic-backup}
+      - LISTEN_ADDR=${LISTEN_ADDR:-0.0.0.0:8000}
+      - RUST_LOG=${RUST_LOG:-info}
+    networks:
+      - restic-network
+
+networks:
+  restic-network:
+    driver: bridge

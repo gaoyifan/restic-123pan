@@ -11,8 +11,8 @@ tokio = { version = "1", features = ["full"] }
 tower = "0.4"
 tower-http = { version = "0.5", features = ["trace", "cors"] }
 
-# HTTP client for 123pan API
-reqwest = { version = "0.12", features = ["json", "multipart", "stream"] }
+# HTTP client for 123pan API (using vendored OpenSSL for thin Docker image)
+reqwest = { version = "0.12", features = ["json", "multipart", "stream", "native-tls-vendored"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -41,5 +41,5 @@ sha2 = "0.10"
 walkdir = "2"
 assert_cmd = "2"
 predicates = "3"
-reqwest = { version = "0.12", features = ["blocking", "json"] }
+reqwest = { version = "0.12", features = ["blocking", "json", "native-tls-vendored"] }
 rand = "0.8"

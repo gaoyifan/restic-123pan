@@ -2,8 +2,7 @@ services:
   restic-123pan:
     build:
       context: .
-    image: restic-123pan:latest
-    container_name: restic-123pan
+    image: ghcr.io/gaoyifan/restic-123pan:latest
     restart: unless-stopped
     ports:
       - "8000:8000"

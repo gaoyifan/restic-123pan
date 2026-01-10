@@ -43,7 +43,7 @@ RUN useradd -m -u 1000 appuser
 WORKDIR /app
 
 # Copy the binary from builder stage
-COPY --from=builder /app/target/release/restic-api-server-123pan /app/restic-api-server-123pan
+COPY --from=builder /app/target/release/restic-123pan /app/restic-123pan
 
 # Change ownership to non-root user
 RUN chown -R appuser:appuser /app
@@ -59,4 +59,4 @@ HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
     CMD curl -f -I http://localhost:8000/config || exit 1
 
 # Run the application
-ENTRYPOINT ["/app/restic-api-server-123pan"]
+ENTRYPOINT ["/app/restic-123pan"]

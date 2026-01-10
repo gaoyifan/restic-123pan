@@ -38,8 +38,8 @@ fn find_available_port() -> u16 {
 
 /// Start the server as a child process with real-time log output.
 fn start_server(client_id: &str, client_secret: &str, port: u16, repo_path: &str) -> Child {
-    let cargo_bin = env::var("CARGO_BIN_EXE_restic-api-server-123pan")
-        .unwrap_or_else(|_| "target/debug/restic-api-server-123pan".to_string());
+    let cargo_bin = env::var("CARGO_BIN_EXE_restic-123pan")
+        .unwrap_or_else(|_| "target/debug/restic-123pan".to_string());
     
     let mut child = Command::new(&cargo_bin)
         .env("PAN123_CLIENT_ID", client_id)

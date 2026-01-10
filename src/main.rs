@@ -8,9 +8,9 @@ use std::net::SocketAddr;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use restic_api_server_123pan::config::Config;
-use restic_api_server_123pan::pan123::Pan123Client;
-use restic_api_server_123pan::restic::create_router;
+use restic_123pan::config::Config;
+use restic_123pan::pan123::Pan123Client;
+use restic_123pan::restic::create_router;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -26,7 +26,7 @@ async fn main() -> anyhow::Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    tracing::info!("Starting restic-api-server-123pan");
+    tracing::info!("Starting restic-123pan");
     tracing::info!("Repository path: {}", config.repo_path);
     tracing::info!("Listen address: {}", config.listen_addr);
 

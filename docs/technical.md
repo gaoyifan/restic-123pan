@@ -1,6 +1,6 @@
 # 技术文档：Restic REST API 123pan 后端实现
 
-本文档详细描述了 restic-api-server-123pan 项目中每个 Restic REST API 的实现逻辑，包括调用的 123pan API。
+本文档详细描述了 restic-123pan 项目中每个 Restic REST API 的实现逻辑，包括调用的 123pan API。
 
 ## 概述
 

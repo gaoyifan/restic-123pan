@@ -5,7 +5,7 @@
 //! - PAN123_CLIENT_SECRET
 
 use bytes::Bytes;
-use restic_api_server_123pan::pan123::Pan123Client;
+use restic_123pan::pan123::Pan123Client;
 use std::env;
 
 /// Get test credentials from environment.

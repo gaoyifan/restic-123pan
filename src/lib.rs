@@ -1,6 +1,6 @@
 //! Restic REST API server backed by 123pan cloud storage.
 //!
-//! This library provides the core functionality for the restic-api-server-123pan.
+//! This library provides the core functionality for the restic-123pan.
 
 pub mod config;
 pub mod error;

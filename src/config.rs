@@ -4,7 +4,7 @@ use clap::Parser;
 
 /// Restic REST API server backed by 123pan cloud storage.
 #[derive(Parser, Debug, Clone)]
-#[command(name = "restic-api-server-123pan")]
+#[command(name = "restic-123pan")]
 #[command(about = "Restic REST API backend server using 123pan cloud storage")]
 pub struct Config {
     /// 123pan client ID

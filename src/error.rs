@@ -1,4 +1,4 @@
-//! Error types for the restic-api-server-123pan application.
+//! Error types for the restic-123pan application.
 
 use axum::{
     http::StatusCode,

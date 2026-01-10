@@ -1,9 +1,9 @@
 services:
-  restic-api-server-123pan:
+  restic-123pan:
     build:
       context: .
-    image: restic-api-server-123pan:latest
-    container_name: restic-api-server-123pan
+    image: restic-123pan:latest
+    container_name: restic-123pan
     restart: unless-stopped
     ports:
       - "8000:8000"

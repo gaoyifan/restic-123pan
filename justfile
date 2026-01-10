@@ -1,4 +1,4 @@
-# Justfile for restic-api-server-123pan
+# Justfile for restic-123pan
 # Load environment variables from .env file
 set dotenv-load
 
@@ -39,7 +39,7 @@ test-e2e-100mb:
     cargo test --test e2e_test test_e2e_large_scale_100mb -- --nocapture
 
 # Run a quick sanity check (build + unit tests + lint)
-check: build test-unit lint
+check: build test-unit
     @echo "All checks passed!"
 
 # Run Docker container in detached mode

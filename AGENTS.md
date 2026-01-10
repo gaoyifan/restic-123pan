@@ -1,6 +1,6 @@
 # AGENTS.md
 
-This file provides guidance for AI agents working with the restic-api-server-123pan codebase.
+This file provides guidance for AI agents working with the restic-123pan codebase.
 
 ## Project Overview
 

@@ -3,9 +3,9 @@ services:
     build:
       context: .
     image: ghcr.io/gaoyifan/restic-123pan:latest
+    container_name: restic-123pan
     restart: unless-stopped
-    ports:
-      - "8000:8000"
+    network_mode: host
     environment:
       - PAN123_CLIENT_ID=${PAN123_CLIENT_ID}
       - PAN123_CLIENT_SECRET=${PAN123_CLIENT_SECRET}

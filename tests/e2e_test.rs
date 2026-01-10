@@ -15,10 +15,11 @@
 
 use std::env;
 use std::fs;
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, Output, Stdio};
+use std::thread;
 use std::time::Duration;
 use tempfile::TempDir;
 
@@ -35,12 +36,12 @@ fn find_available_port() -> u16 {
     listener.local_addr().unwrap().port()
 }
 
-/// Start the server as a child process.
+/// Start the server as a child process with real-time log output.
 fn start_server(client_id: &str, client_secret: &str, port: u16, repo_path: &str) -> Child {
     let cargo_bin = env::var("CARGO_BIN_EXE_restic-api-server-123pan")
         .unwrap_or_else(|_| "target/debug/restic-api-server-123pan".to_string());
     
-    Command::new(&cargo_bin)
+    let mut child = Command::new(&cargo_bin)
         .env("PAN123_CLIENT_ID", client_id)
         .env("PAN123_CLIENT_SECRET", client_secret)
         .env("PAN123_REPO_PATH", repo_path)
@@ -49,7 +50,141 @@ fn start_server(client_id: &str, client_secret: &str, port: u16, repo_path: &str
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("Failed to start server")
+        .expect("Failed to start server");
+    
+    // Spawn threads to forward server logs in real-time
+    let stdout = child.stdout.take().expect("Failed to take stdout");
+    let stderr = child.stderr.take().expect("Failed to take stderr");
+    
+    let stdout_reader = BufReader::new(stdout);
+    let stderr_reader = BufReader::new(stderr);
+    
+    // Forward stdout
+    thread::spawn(move || {
+        for line in stdout_reader.lines() {
+            if let Ok(line) = line {
+                println!("[SERVER] {}", line);
+            }
+        }
+    });
+    
+    // Forward stderr
+    thread::spawn(move || {
+        for line in stderr_reader.lines() {
+            if let Ok(line) = line {
+                eprintln!("[SERVER] {}", line);
+            }
+        }
+    });
+    
+    child
+}
+
+/// Run a restic command with real-time output.
+/// Returns the command output and success status.
+fn run_restic_with_output(
+    repo_url: &str,
+    password: &str,
+    args: &[&str],
+    description: &str,
+) -> (Output, bool) {
+    println!("\n>>> {}...", description);
+    println!("Command: restic -r {} {}", repo_url, args.join(" "));
+    
+    // Use output() for simple commands that complete quickly
+    // For long-running commands like backup, we'll use spawn with real-time output
+    let is_long_running = args.contains(&"backup") || args.contains(&"restore");
+    
+    if is_long_running {
+        // For long-running commands, use spawn with real-time output
+        let mut child = Command::new("restic")
+            .args(["-r", repo_url])
+            .args(args)
+            .env("RESTIC_PASSWORD", password)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("Failed to spawn restic command");
+        
+        let stdout = child.stdout.take().expect("Failed to take stdout");
+        let stderr = child.stderr.take().expect("Failed to take stderr");
+        
+        // Forward stdout in real-time and collect
+        let stdout_handle = thread::spawn(move || {
+            let reader = BufReader::new(stdout);
+            let mut collected = Vec::new();
+            for line in reader.lines() {
+                if let Ok(line) = line {
+                    println!("[RESTIC] {}", line);
+                    collected.push(line);
+                }
+            }
+            collected
+        });
+        
+        // Forward stderr in real-time and collect
+        let stderr_handle = thread::spawn(move || {
+            let reader = BufReader::new(stderr);
+            let mut collected = Vec::new();
+            for line in reader.lines() {
+                if let Ok(line) = line {
+                    eprintln!("[RESTIC] {}", line);
+                    collected.push(line);
+                }
+            }
+            collected
+        });
+        
+        // Wait for process to complete
+        let status = child.wait().expect("Failed to wait for restic");
+        let success = status.success();
+        
+        // Wait for output threads to finish
+        let stdout_lines = stdout_handle.join().unwrap();
+        let stderr_lines = stderr_handle.join().unwrap();
+        
+        // Build Output struct
+        let output = Output {
+            status,
+            stdout: stdout_lines.join("\n").into_bytes(),
+            stderr: stderr_lines.join("\n").into_bytes(),
+        };
+        
+        if !success {
+            eprintln!("[ERROR] Command failed with status: {:?}", output.status);
+        }
+        
+        (output, success)
+    } else {
+        // For quick commands, use output() and print results
+        let output = Command::new("restic")
+            .args(["-r", repo_url])
+            .args(args)
+            .env("RESTIC_PASSWORD", password)
+            .output()
+            .expect("Failed to run restic command");
+        
+        // Print output
+        if !output.stdout.is_empty() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines() {
+                println!("[RESTIC] {}", line);
+            }
+        }
+        if !output.stderr.is_empty() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            for line in stderr.lines() {
+                eprintln!("[RESTIC] {}", line);
+            }
+        }
+        
+        let success = output.status.success();
+        if !success {
+            eprintln!("[ERROR] Command failed with status: {:?}", output.status);
+        }
+        
+        (output, success)
+    }
 }
 
 /// Wait for the server to be ready.
@@ -317,11 +452,13 @@ fn test_server_startup() {
 // Large Scale Tests (~100MB)
 // ============================================================================
 
-/// Create test files of a specific total size.
+/// Create test files of a specific total size using truly random, incompressible data.
 /// Generates a mix of small, medium, and large files to simulate real workloads.
 fn create_large_test_files(dir: &PathBuf, total_size_mb: usize) {
+    use rand::Rng;
     use std::io::BufWriter;
     
+    let mut rng = rand::thread_rng();
     let total_bytes = total_size_mb * 1024 * 1024;
     let mut created_bytes = 0usize;
     let mut file_counter = 0usize;
@@ -344,22 +481,10 @@ fn create_large_test_files(dir: &PathBuf, total_size_mb: usize) {
     fs::create_dir_all(&medium_dir).expect("Failed to create medium dir");
     fs::create_dir_all(&small_dir).expect("Failed to create small dir");
     
-    // Pre-generate random-ish content (not truly random but varied)
-    // Use a pattern that compresses somewhat like real data
-    let chunk_size = 64 * 1024; // 64KB chunks
-    let mut chunk = Vec::with_capacity(chunk_size);
-    for i in 0..chunk_size {
-        // Mix of patterns: some repeated, some varying
-        let byte = match i % 16 {
-            0..=7 => ((i * 7 + file_counter) % 256) as u8,  // Varying
-            8..=11 => 0x00,  // Zeros (compressible)
-            12..=14 => 0xFF,  // Ones (compressible)
-            _ => ((i ^ file_counter) % 256) as u8,  // XOR pattern
-        };
-        chunk.push(byte);
-    }
+    // Use larger chunks for efficiency
+    let chunk_size = 256 * 1024; // 256KB chunks
     
-    // Create large files (5-20MB each)
+    // Create large files (5-20MB each) with random data
     let mut large_created = 0usize;
     while large_created < large_target {
         let file_size = 5 * 1024 * 1024 + (file_counter * 3 * 1024 * 1024) % (15 * 1024 * 1024);
@@ -372,12 +497,9 @@ fn create_large_test_files(dir: &PathBuf, total_size_mb: usize) {
         let mut written = 0usize;
         while written < file_size {
             let to_write = (file_size - written).min(chunk_size);
-            // Vary the chunk slightly for each write
-            let varied_chunk: Vec<u8> = chunk[..to_write].iter()
-                .enumerate()
-                .map(|(i, &b)| b.wrapping_add((written / chunk_size + i) as u8))
-                .collect();
-            writer.write_all(&varied_chunk).expect("Failed to write");
+            // Generate truly random bytes (incompressible)
+            let random_chunk: Vec<u8> = (0..to_write).map(|_| rng.gen()).collect();
+            writer.write_all(&random_chunk).expect("Failed to write");
             written += to_write;
         }
         
@@ -386,9 +508,9 @@ fn create_large_test_files(dir: &PathBuf, total_size_mb: usize) {
         file_counter += 1;
     }
     
-    println!("Created {} bytes in large files", large_created);
+    println!("Created {} bytes in large files (random, incompressible)", large_created);
     
-    // Create medium files (100KB-1MB each)
+    // Create medium files (100KB-1MB each) with random data
     let mut medium_created = 0usize;
     while medium_created < medium_target {
         let file_size = 100 * 1024 + (file_counter * 100 * 1024) % (900 * 1024);
@@ -401,11 +523,8 @@ fn create_large_test_files(dir: &PathBuf, total_size_mb: usize) {
         let mut written = 0usize;
         while written < file_size {
             let to_write = (file_size - written).min(chunk_size);
-            let varied_chunk: Vec<u8> = chunk[..to_write].iter()
-                .enumerate()
-                .map(|(i, &b)| b.wrapping_add((written / 1024 + i + file_counter) as u8))
-                .collect();
-            writer.write_all(&varied_chunk).expect("Failed to write");
+            let random_chunk: Vec<u8> = (0..to_write).map(|_| rng.gen()).collect();
+            writer.write_all(&random_chunk).expect("Failed to write");
             written += to_write;
         }
         
@@ -414,32 +533,27 @@ fn create_large_test_files(dir: &PathBuf, total_size_mb: usize) {
         file_counter += 1;
     }
     
-    println!("Created {} bytes in medium files", medium_created);
+    println!("Created {} bytes in medium files (random, incompressible)", medium_created);
     
-    // Create small files (1KB-10KB each)
+    // Create small files (1KB-10KB each) with random data
     let mut small_created = 0usize;
     while small_created < small_target {
         let file_size = 1024 + (file_counter * 1024) % (9 * 1024);
         let file_size = file_size.min(small_target - small_created);
         
-        let path = small_dir.join(format!("small_{:04}.txt", file_counter));
+        let path = small_dir.join(format!("small_{:04}.bin", file_counter));
         let mut file = fs::File::create(&path).expect("Failed to create small file");
         
-        // For small files, create text content
-        let content: String = (0..file_size)
-            .map(|i| {
-                let c = ((i + file_counter) % 26 + 97) as u8 as char;
-                if i % 80 == 79 { '\n' } else { c }
-            })
-            .collect();
-        file.write_all(content.as_bytes()).expect("Failed to write");
+        // Random bytes for small files too
+        let random_data: Vec<u8> = (0..file_size).map(|_| rng.gen()).collect();
+        file.write_all(&random_data).expect("Failed to write");
         
         small_created += file_size;
         created_bytes += file_size;
         file_counter += 1;
     }
     
-    println!("Created {} bytes in small files", small_created);
+    println!("Created {} bytes in small files (random, incompressible)", small_created);
     println!("Total: {} bytes ({} MB) in {} files", 
              created_bytes, created_bytes / 1024 / 1024, file_counter);
 }
@@ -496,15 +610,15 @@ fn test_e2e_large_scale_100mb() {
     let password = "large-test-password-456";
     
     // Initialize repository
-    println!("Initializing repository...");
     let start_init = std::time::Instant::now();
-    let init_output = Command::new("restic")
-        .args(["-r", &repo_url, "init"])
-        .env("RESTIC_PASSWORD", password)
-        .output()
-        .expect("Failed to run restic init");
+    let (init_output, init_success) = run_restic_with_output(
+        &repo_url,
+        password,
+        &["init"],
+        "Initializing repository",
+    );
     
-    if !init_output.status.success() {
+    if !init_success {
         let stderr = String::from_utf8_lossy(&init_output.stderr);
         let stdout = String::from_utf8_lossy(&init_output.stdout);
         server.kill().ok();
@@ -512,16 +626,16 @@ fn test_e2e_large_scale_100mb() {
     }
     println!("Repository initialized in {:?}", start_init.elapsed());
     
-    // Backup files
-    println!("Backing up ~100MB of files...");
+    // Backup files with real-time output
     let start_backup = std::time::Instant::now();
-    let backup_output = Command::new("restic")
-        .args(["-r", &repo_url, "backup", source_dir.to_str().unwrap()])
-        .env("RESTIC_PASSWORD", password)
-        .output()
-        .expect("Failed to run restic backup");
+    let (backup_output, backup_success) = run_restic_with_output(
+        &repo_url,
+        password,
+        &["backup", source_dir.to_str().unwrap()],
+        "Backing up ~100MB of files (this may take several minutes)",
+    );
     
-    if !backup_output.status.success() {
+    if !backup_success {
         let stderr = String::from_utf8_lossy(&backup_output.stderr);
         let stdout = String::from_utf8_lossy(&backup_output.stdout);
         server.kill().ok();
@@ -529,19 +643,18 @@ fn test_e2e_large_scale_100mb() {
     }
     
     let backup_time = start_backup.elapsed();
-    println!("Backup completed in {:?}", backup_time);
-    println!("Backup output: {}", String::from_utf8_lossy(&backup_output.stdout));
+    println!("\nBackup completed in {:?}", backup_time);
     
     // Check repository integrity
-    println!("Checking repository integrity...");
     let start_check = std::time::Instant::now();
-    let check_output = Command::new("restic")
-        .args(["-r", &repo_url, "check"])
-        .env("RESTIC_PASSWORD", password)
-        .output()
-        .expect("Failed to run restic check");
+    let (check_output, check_success) = run_restic_with_output(
+        &repo_url,
+        password,
+        &["check"],
+        "Checking repository integrity",
+    );
     
-    if !check_output.status.success() {
+    if !check_success {
         let stderr = String::from_utf8_lossy(&check_output.stderr);
         println!("WARNING: restic check reported issues: {}", stderr);
     } else {
@@ -549,25 +662,23 @@ fn test_e2e_large_scale_100mb() {
     }
     
     // List snapshots
-    println!("Listing snapshots...");
-    let snapshots_output = Command::new("restic")
-        .args(["-r", &repo_url, "snapshots"])
-        .env("RESTIC_PASSWORD", password)
-        .output()
-        .expect("Failed to run restic snapshots");
-    
-    println!("Snapshots: {}", String::from_utf8_lossy(&snapshots_output.stdout));
+    let (_snapshots_output, _) = run_restic_with_output(
+        &repo_url,
+        password,
+        &["snapshots"],
+        "Listing snapshots",
+    );
     
     // Restore latest snapshot
-    println!("Restoring files...");
     let start_restore = std::time::Instant::now();
-    let restore_output = Command::new("restic")
-        .args(["-r", &repo_url, "restore", "latest", "--target", restore_dir.to_str().unwrap()])
-        .env("RESTIC_PASSWORD", password)
-        .output()
-        .expect("Failed to run restic restore");
+    let (restore_output, restore_success) = run_restic_with_output(
+        &repo_url,
+        password,
+        &["restore", "latest", "--target", restore_dir.to_str().unwrap()],
+        "Restoring files",
+    );
     
-    if !restore_output.status.success() {
+    if !restore_success {
         let stderr = String::from_utf8_lossy(&restore_output.stderr);
         let stdout = String::from_utf8_lossy(&restore_output.stdout);
         server.kill().ok();
@@ -575,7 +686,7 @@ fn test_e2e_large_scale_100mb() {
     }
     
     let restore_time = start_restore.elapsed();
-    println!("Restore completed in {:?}", restore_time);
+    println!("\nRestore completed in {:?}", restore_time);
     
     // Stop server
     server.kill().ok();

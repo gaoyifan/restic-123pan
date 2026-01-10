@@ -1,0 +1,541 @@
+//! 123pan API client for file operations.
+
+use bytes::Bytes;
+use reqwest::multipart::{Form, Part};
+use std::collections::HashMap;
+use std::sync::Arc;
+use parking_lot::RwLock;
+
+use crate::error::{AppError, Result};
+use super::auth::{TokenManager, BASE_URL};
+use super::types::*;
+
+/// Client for interacting with 123pan API.
+#[derive(Clone)]
+pub struct Pan123Client {
+    token_manager: TokenManager,
+    repo_path: String,
+    /// Cache of directory IDs: path -> file_id
+    dir_cache: Arc<RwLock<HashMap<String, i64>>>,
+    /// Upload domain (fetched dynamically)
+    upload_domain: Arc<RwLock<Option<String>>>,
+}
+
+impl Pan123Client {
+    /// Create a new 123pan client.
+    pub fn new(client_id: String, client_secret: String, repo_path: String) -> Self {
+        Self {
+            token_manager: TokenManager::new(client_id, client_secret),
+            repo_path,
+            dir_cache: Arc::new(RwLock::new(HashMap::new())),
+            upload_domain: Arc::new(RwLock::new(None)),
+        }
+    }
+
+    /// Make an authenticated GET request.
+    async fn get<T: serde::de::DeserializeOwned>(&self, url: &str) -> Result<ApiResponse<T>> {
+        let token = self.token_manager.get_token().await?;
+        
+        let response = self
+            .token_manager
+            .http_client()
+            .get(url)
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Platform", "open_platform")
+            .send()
+            .await?;
+
+        Ok(response.json().await?)
+    }
+
+    /// Make an authenticated POST request with JSON body.
+    async fn post<T: serde::de::DeserializeOwned, B: serde::Serialize>(
+        &self,
+        url: &str,
+        body: &B,
+    ) -> Result<ApiResponse<T>> {
+        let token = self.token_manager.get_token().await?;
+        
+        let response = self
+            .token_manager
+            .http_client()
+            .post(url)
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Platform", "open_platform")
+            .header("Content-Type", "application/json")
+            .json(body)
+            .send()
+            .await?;
+
+        Ok(response.json().await?)
+    }
+
+    // ========================================================================
+    // Upload Domain
+    // ========================================================================
+
+    /// Get upload domain, fetching dynamically if not cached.
+    async fn get_upload_domain(&self) -> Result<String> {
+        // Check cache first
+        {
+            let cache = self.upload_domain.read();
+            if let Some(domain) = cache.as_ref() {
+                return Ok(domain.clone());
+            }
+        }
+
+        // Fetch from API
+        let token = self.token_manager.get_token().await?;
+        let url = format!("{}/upload/v2/file/domain", BASE_URL);
+        
+        let response = self
+            .token_manager
+            .http_client()
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Platform", "open_platform")
+            .send()
+            .await?;
+
+        let api_response: ApiResponse<Vec<String>> = response.json().await?;
+
+        if !api_response.is_success() {
+            return Err(AppError::Pan123Api {
+                code: api_response.code,
+                message: api_response.message,
+            });
+        }
+
+        let domains = api_response.data.ok_or_else(|| {
+            AppError::Internal("No upload domain in response".to_string())
+        })?;
+
+        let domain = domains.into_iter().next().ok_or_else(|| {
+            AppError::Internal("Empty upload domain list".to_string())
+        })?;
+
+        tracing::info!("Fetched upload domain: {}", domain);
+
+        // Cache the domain
+        {
+            let mut cache = self.upload_domain.write();
+            *cache = Some(domain.clone());
+        }
+
+        Ok(domain)
+    }
+
+    // ========================================================================
+    // Directory Operations
+    // ========================================================================
+
+    /// List files in a directory.
+    pub async fn list_files(&self, parent_id: i64) -> Result<Vec<FileInfo>> {
+        let mut all_files = Vec::new();
+        let mut last_file_id: Option<i64> = None;
+
+        loop {
+            let mut url = format!(
+                "{}/api/v2/file/list?parentFileId={}&limit=100",
+                BASE_URL, parent_id
+            );
+            
+            if let Some(id) = last_file_id {
+                url.push_str(&format!("&lastFileId={}", id));
+            }
+
+            let response: ApiResponse<FileListData> = self.get(&url).await?;
+
+            if !response.is_success() {
+                return Err(AppError::Pan123Api {
+                    code: response.code,
+                    message: response.message,
+                });
+            }
+
+            if let Some(data) = response.data {
+                // Filter out trashed files
+                let files: Vec<_> = data.file_list.into_iter()
+                    .filter(|f| !f.is_trashed())
+                    .collect();
+                
+                all_files.extend(files);
+
+                if data.last_file_id == -1 {
+                    break;
+                }
+                last_file_id = Some(data.last_file_id);
+            } else {
+                break;
+            }
+        }
+
+        Ok(all_files)
+    }
+
+    /// Find a file by exact name in a directory.
+    /// Uses directory listing instead of search (search has index delay issues).
+    pub async fn find_file(&self, parent_id: i64, name: &str) -> Result<Option<FileInfo>> {
+        let files = self.list_files(parent_id).await?;
+        Ok(files.into_iter().find(|f| f.filename == name))
+    }
+
+    /// Create a directory. Returns the directory ID.
+    /// If the directory already exists, returns an error with code 5063.
+    async fn create_directory(&self, parent_id: i64, name: &str) -> Result<i64> {
+        tracing::debug!("Creating directory '{}' in parent {}", name, parent_id);
+
+        let request = CreateDirRequest {
+            name: name.to_string(),
+            parent_id,
+        };
+
+        // mkdir uses BASE_URL, not upload domain
+        let url = format!("{}/upload/v1/file/mkdir", BASE_URL);
+
+        let response: ApiResponse<CreateDirData> = self.post(&url, &request).await?;
+
+        if !response.is_success() {
+            tracing::debug!("mkdir failed: code={}, message='{}'", response.code, response.message);
+            // Code 1: directory already exists (message: 该目录下已经有同名文件夹,无法进行创建)
+            if response.code == 1 && response.message.contains("同名") {
+                tracing::debug!("Directory '{}' already exists, looking up its ID via list_files", name);
+                // Search mode has index delay, use list_files instead
+                let files = self.list_files(parent_id).await?;
+                if let Some(file) = files.into_iter().find(|f| f.filename == name && f.is_folder()) {
+                    tracing::debug!("Found directory '{}' with id {}", file.filename, file.file_id);
+                    return Ok(file.file_id);
+                } else {
+                    tracing::debug!("Directory '{}' not found in list for parent {}", name, parent_id);
+                }
+            }
+            return Err(AppError::Pan123Api {
+                code: response.code,
+                message: response.message,
+            });
+        }
+
+        let data = response.data.ok_or_else(|| {
+            AppError::Internal("No data in mkdir response".to_string())
+        })?;
+
+        tracing::info!("Created directory '{}' with id {}", name, data.dir_id);
+        Ok(data.dir_id)
+    }
+
+    /// Find directory ID for a path by traversing from root.
+    /// Does NOT create directories if they don't exist.
+    pub async fn find_path_id(&self, path: &str) -> Result<Option<i64>> {
+        // Check cache first
+        {
+            let cache = self.dir_cache.read();
+            if let Some(&id) = cache.get(path) {
+                return Ok(Some(id));
+            }
+        }
+
+        let parts: Vec<&str> = path
+            .trim_start_matches('/')
+            .trim_end_matches('/')
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        let mut current_id: i64 = 0; // Root directory
+        let mut current_path = String::new();
+
+        for part in parts {
+            current_path.push('/');
+            current_path.push_str(part);
+
+            // Check cache for this path segment
+            {
+                let cache = self.dir_cache.read();
+                if let Some(&id) = cache.get(&current_path) {
+                    current_id = id;
+                    continue;
+                }
+            }
+
+            // Look for the directory in the current parent
+            if let Some(file) = self.find_file(current_id, part).await? {
+                if file.is_folder() {
+                    current_id = file.file_id;
+                    // Update cache
+                    {
+                        let mut cache = self.dir_cache.write();
+                        cache.insert(current_path.clone(), current_id);
+                    }
+                } else {
+                    // Found a file with this name, not a directory
+                    return Ok(None);
+                }
+            } else {
+                // Directory doesn't exist
+                return Ok(None);
+            }
+        }
+
+        Ok(Some(current_id))
+    }
+
+    /// Get or create a directory path using mkdir API.
+    pub async fn ensure_path(&self, path: &str) -> Result<i64> {
+        // First try to find existing path
+        if let Some(id) = self.find_path_id(path).await? {
+            return Ok(id);
+        }
+
+        // Path doesn't exist, create it using mkdir API
+        let parts: Vec<&str> = path
+            .trim_start_matches('/')
+            .trim_end_matches('/')
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        let mut current_id: i64 = 0; // Root directory
+        let mut current_path = String::new();
+
+        for part in parts {
+            current_path.push('/');
+            current_path.push_str(part);
+
+            // Check if this segment already exists
+            if let Some(file) = self.find_file(current_id, part).await? {
+                if file.is_folder() {
+                    current_id = file.file_id;
+                    // Update cache
+                    {
+                        let mut cache = self.dir_cache.write();
+                        cache.insert(current_path.clone(), current_id);
+                    }
+                    continue;
+                } else {
+                    return Err(AppError::Internal(format!(
+                        "Path component '{}' exists but is not a directory", part
+                    )));
+                }
+            }
+
+            // Create the directory
+            current_id = self.create_directory(current_id, part).await?;
+            
+            // Update cache
+            {
+                let mut cache = self.dir_cache.write();
+                cache.insert(current_path.clone(), current_id);
+            }
+        }
+
+        Ok(current_id)
+    }
+
+    /// Get the directory ID for a restic file type.
+    pub async fn get_type_dir_id(&self, file_type: ResticFileType) -> Result<i64> {
+        if file_type.is_config() {
+            // Config is stored at repo root level
+            self.ensure_path(&self.repo_path.clone()).await
+        } else {
+            let path = format!("{}/{}", self.repo_path, file_type.dirname());
+            self.ensure_path(&path).await
+        }
+    }
+
+    // ========================================================================
+    // File Operations
+    // ========================================================================
+
+    /// Upload a file using single-step upload (for files <= 1GB).
+    /// Uses duplicate=2 to overwrite existing files atomically.
+    pub async fn upload_file(
+        &self,
+        parent_id: i64,
+        filename: &str,
+        data: Bytes,
+    ) -> Result<i64> {
+        tracing::debug!("Uploading file '{}' ({} bytes) to parent {}", filename, data.len(), parent_id);
+
+        // Calculate MD5 hash
+        let md5_hash = format!("{:x}", md5::compute(&data));
+
+        let token = self.token_manager.get_token().await?;
+        let upload_domain = self.get_upload_domain().await?;
+
+        // Create multipart form with duplicate=2 for atomic overwrite
+        let form = Form::new()
+            .text("parentFileID", parent_id.to_string())
+            .text("filename", filename.to_string())
+            .text("etag", md5_hash)
+            .text("size", data.len().to_string())
+            .text("duplicate", "2") // Overwrite existing file atomically
+            .part("file", Part::bytes(data.to_vec()).file_name(filename.to_string()));
+
+        let response = self
+            .token_manager
+            .http_client()
+            .post(format!("{}/upload/v2/file/single/create", upload_domain))
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Platform", "open_platform")
+            .multipart(form)
+            .send()
+            .await?;
+
+        let status = response.status();
+        let text = response.text().await?;
+        
+        tracing::debug!("Upload response status: {}, body: {}", status, text);
+
+        let api_response: ApiResponse<SingleUploadData> = serde_json::from_str(&text)?;
+
+        if !api_response.is_success() {
+            return Err(AppError::Pan123Api {
+                code: api_response.code,
+                message: api_response.message,
+            });
+        }
+
+        let upload_data = api_response.data.ok_or_else(|| {
+            AppError::Internal("No data in upload response".to_string())
+        })?;
+
+        if !upload_data.completed {
+            return Err(AppError::Internal("Upload not completed".to_string()));
+        }
+
+        tracing::info!("Uploaded file '{}' with id {}", filename, upload_data.file_id);
+        Ok(upload_data.file_id)
+    }
+
+    /// Get download URL for a file.
+    pub async fn get_download_url(&self, file_id: i64) -> Result<String> {
+        let url = format!("{}/api/v1/file/download_info?fileId={}", BASE_URL, file_id);
+        let response: ApiResponse<DownloadInfoData> = self.get(&url).await?;
+
+        if !response.is_success() {
+            if response.code == 5066 {
+                return Err(AppError::NotFound(format!("File {} not found", file_id)));
+            }
+            return Err(AppError::Pan123Api {
+                code: response.code,
+                message: response.message,
+            });
+        }
+
+        let data = response.data.ok_or_else(|| {
+            AppError::Internal("No data in download info response".to_string())
+        })?;
+
+        Ok(data.download_url)
+    }
+
+    /// Download a file's content with optional range support.
+    /// Uses 123pan's native range download capability.
+    pub async fn download_file(&self, file_id: i64, range: Option<(u64, u64)>) -> Result<Bytes> {
+        let download_url = self.get_download_url(file_id).await?;
+
+        let mut request = self.token_manager.http_client().get(&download_url);
+        
+        // Pass Range header to 123pan for native range support
+        if let Some((start, end)) = range {
+            request = request.header("Range", format!("bytes={}-{}", start, end));
+        }
+
+        let response = request.send().await?;
+
+        if !response.status().is_success() && response.status().as_u16() != 206 {
+            return Err(AppError::Internal(format!(
+                "Download failed with status: {}",
+                response.status()
+            )));
+        }
+
+        Ok(response.bytes().await?)
+    }
+
+    /// Move a file to trash.
+    pub async fn trash_file(&self, file_id: i64) -> Result<()> {
+        tracing::debug!("Moving file {} to trash", file_id);
+
+        let request = TrashRequest {
+            file_ids: vec![file_id],
+        };
+
+        let response: ApiResponse<()> = self
+            .post(&format!("{}/api/v1/file/trash", BASE_URL), &request)
+            .await?;
+
+        if !response.is_success() {
+            return Err(AppError::Pan123Api {
+                code: response.code,
+                message: response.message,
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Permanently delete a file (must be in trash first).
+    pub async fn delete_file(&self, file_id: i64) -> Result<()> {
+        tracing::debug!("Permanently deleting file {}", file_id);
+
+        // First move to trash
+        self.trash_file(file_id).await?;
+
+        // Then permanently delete
+        let request = DeleteRequest {
+            file_ids: vec![file_id],
+        };
+
+        let response: ApiResponse<()> = self
+            .post(&format!("{}/api/v1/file/delete", BASE_URL), &request)
+            .await?;
+
+        if !response.is_success() {
+            return Err(AppError::Pan123Api {
+                code: response.code,
+                message: response.message,
+            });
+        }
+
+        tracing::info!("Deleted file {}", file_id);
+        Ok(())
+    }
+
+    /// Check if a file exists and get its info using precise search.
+    pub async fn get_file_info(&self, parent_id: i64, filename: &str) -> Result<Option<FileInfo>> {
+        self.find_file(parent_id, filename).await
+    }
+
+    /// Initialize the repository structure.
+    pub async fn init_repository(&self) -> Result<()> {
+        tracing::info!("Initializing repository at {}", self.repo_path);
+
+        // Create root directory
+        self.ensure_path(&self.repo_path.clone()).await?;
+
+        // Create type directories
+        for file_type in [
+            ResticFileType::Data,
+            ResticFileType::Keys,
+            ResticFileType::Locks,
+            ResticFileType::Snapshots,
+            ResticFileType::Index,
+        ] {
+            let path = format!("{}/{}", self.repo_path, file_type.dirname());
+            self.ensure_path(&path).await?;
+        }
+
+        tracing::info!("Repository initialized successfully");
+        Ok(())
+    }
+}
+
+impl std::fmt::Debug for Pan123Client {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Pan123Client")
+            .field("token_manager", &self.token_manager)
+            .field("repo_path", &self.repo_path)
+            .finish()
+    }
+}

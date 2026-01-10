@@ -1,0 +1,44 @@
+[package]
+name = "restic-api-server-123pan"
+version = "0.1.0"
+edition = "2021"
+description = "Restic REST API backend server using 123pan cloud storage"
+
+[dependencies]
+# Web framework
+axum = { version = "0.7", features = ["multipart"] }
+tokio = { version = "1", features = ["full"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["trace", "cors"] }
+
+# HTTP client for 123pan API
+reqwest = { version = "0.12", features = ["json", "multipart", "stream"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Error handling
+thiserror = "1"
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# Utilities
+chrono = { version = "0.4", features = ["serde"] }
+md5 = "0.7"
+bytes = "1"
+parking_lot = "0.12"
+
+[dev-dependencies]
+tempfile = "3"
+sha2 = "0.10"
+walkdir = "2"
+assert_cmd = "2"
+predicates = "3"
+reqwest = { version = "0.12", features = ["blocking", "json"] }

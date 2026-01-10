@@ -1,0 +1,59 @@
+//! Restic REST API server backed by 123pan cloud storage.
+//!
+//! This server implements the Restic REST backend protocol and uses
+//! 123pan as the underlying storage provider.
+
+mod config;
+mod error;
+mod pan123;
+mod restic;
+
+use clap::Parser;
+use std::net::SocketAddr;
+use tower_http::trace::TraceLayer;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+use crate::config::Config;
+use crate::pan123::Pan123Client;
+use crate::restic::create_router;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // Parse configuration
+    let config = Config::parse();
+
+    // Initialize logging
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| config.log_level.clone().into()),
+        )
+        .with(tracing_subscriber::fmt::layer())
+        .init();
+
+    tracing::info!("Starting restic-api-server-123pan");
+    tracing::info!("Repository path: {}", config.repo_path);
+    tracing::info!("Listen address: {}", config.listen_addr);
+
+    // Create 123pan client
+    let client = Pan123Client::new(
+        config.client_id.clone(),
+        config.client_secret.clone(),
+        config.repo_path.clone(),
+    );
+
+    // Create router
+    let app = create_router(client)
+        .layer(TraceLayer::new_for_http());
+
+    // Parse listen address
+    let addr: SocketAddr = config.listen_addr.parse()?;
+
+    tracing::info!("Server listening on http://{}", addr);
+
+    // Start server
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, app).await?;
+
+    Ok(())
+}

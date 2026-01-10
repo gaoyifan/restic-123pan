@@ -8,7 +8,6 @@ use axum::{
     routing::{get, head, post},
     Router,
 };
-use bytes::Bytes;
 use serde::Deserialize;
 use std::sync::Arc;
 
@@ -125,8 +124,12 @@ async fn get_config(
 /// POST /config - Save config file.
 async fn post_config(
     State(state): State<Arc<AppState>>,
-    body: Bytes,
+    body: axum::body::Body,
 ) -> Result<impl IntoResponse> {
+    // Convert body to Bytes with 1GB limit
+    let body = axum::body::to_bytes(body, 1024 * 1024 * 1024).await
+        .map_err(|e| AppError::BadRequest(format!("Failed to read request body: {}", e)))?;
+    
     tracing::info!("Saving config ({} bytes)", body.len());
 
     let dir_id = state.client.get_type_dir_id(ResticFileType::Config).await?;
@@ -296,8 +299,12 @@ async fn get_file(
 async fn post_file(
     State(state): State<Arc<AppState>>,
     Path((type_str, name)): Path<(String, String)>,
-    body: Bytes,
+    body: axum::body::Body,
 ) -> Result<impl IntoResponse> {
+    // Convert body to Bytes with 1GB limit
+    let body = axum::body::to_bytes(body, 1024 * 1024 * 1024).await
+        .map_err(|e| AppError::BadRequest(format!("Failed to read request body: {}", e)))?;
+    
     let file_type = ResticFileType::from_str(&type_str)
         .ok_or_else(|| AppError::BadRequest(format!("Invalid type: {}", type_str)))?;
 

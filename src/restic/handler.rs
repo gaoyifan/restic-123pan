@@ -11,9 +11,9 @@ use axum::{
 use serde::Deserialize;
 use std::sync::Arc;
 
+use super::types::FileEntryV2;
 use crate::error::{AppError, Result};
 use crate::pan123::{Pan123Client, ResticFileType};
-use super::types::FileEntryV2;
 
 /// Application state shared across handlers.
 #[derive(Clone)]
@@ -39,13 +39,19 @@ pub fn create_router(client: Pan123Client) -> Router {
         // Repository operations
         .route("/", post(create_repository).delete(delete_repository))
         // Config operations
-        .route("/config", head(head_config).get(get_config).post(post_config))
+        .route(
+            "/config",
+            head(head_config).get(get_config).post(post_config),
+        )
         // Type directory listing
         .route("/:type/", get(list_files))
-        // Individual file operations  
+        // Individual file operations
         .route(
             "/:type/:name",
-            head(head_file).get(get_file).post(post_file).delete(delete_file),
+            head(head_file)
+                .get(get_file)
+                .post(post_file)
+                .delete(delete_file),
         )
         .with_state(state)
 }
@@ -60,7 +66,9 @@ async fn create_repository(
     Query(query): Query<CreateQuery>,
 ) -> Result<impl IntoResponse> {
     if query.create != Some(true) {
-        return Err(AppError::BadRequest("Missing create=true parameter".to_string()));
+        return Err(AppError::BadRequest(
+            "Missing create=true parameter".to_string(),
+        ));
     }
 
     tracing::info!("Creating repository");
@@ -79,11 +87,9 @@ async fn delete_repository() -> impl IntoResponse {
 // ============================================================================
 
 /// HEAD /config - Check if config exists.
-async fn head_config(
-    State(state): State<Arc<AppState>>,
-) -> Result<impl IntoResponse> {
+async fn head_config(State(state): State<Arc<AppState>>) -> Result<impl IntoResponse> {
     let dir_id = state.client.get_type_dir_id(ResticFileType::Config).await?;
-    
+
     match state.client.get_file_info(dir_id, "config").await? {
         Some(file) => {
             let mut headers = HeaderMap::new();
@@ -98,12 +104,13 @@ async fn head_config(
 }
 
 /// GET /config - Get config file.
-async fn get_config(
-    State(state): State<Arc<AppState>>,
-) -> Result<impl IntoResponse> {
+async fn get_config(State(state): State<Arc<AppState>>) -> Result<impl IntoResponse> {
     let dir_id = state.client.get_type_dir_id(ResticFileType::Config).await?;
-    
-    let file = state.client.get_file_info(dir_id, "config").await?
+
+    let file = state
+        .client
+        .get_file_info(dir_id, "config")
+        .await?
         .ok_or_else(|| AppError::NotFound("config".to_string()))?;
 
     let data = state.client.download_file(file.file_id, None).await?;
@@ -127,13 +134,14 @@ async fn post_config(
     body: axum::body::Body,
 ) -> Result<impl IntoResponse> {
     // Convert body to Bytes with 1GB limit
-    let body = axum::body::to_bytes(body, 1024 * 1024 * 1024).await
+    let body = axum::body::to_bytes(body, 1024 * 1024 * 1024)
+        .await
         .map_err(|e| AppError::BadRequest(format!("Failed to read request body: {}", e)))?;
-    
+
     tracing::info!("Saving config ({} bytes)", body.len());
 
     let dir_id = state.client.get_type_dir_id(ResticFileType::Config).await?;
-    
+
     // With duplicate=2, upload will overwrite existing file atomically
     state.client.upload_file(dir_id, "config", body).await?;
 
@@ -153,7 +161,9 @@ async fn list_files(
         .ok_or_else(|| AppError::BadRequest(format!("Invalid type: {}", type_str)))?;
 
     if file_type.is_config() {
-        return Err(AppError::BadRequest("Use /config endpoint for config".to_string()));
+        return Err(AppError::BadRequest(
+            "Use /config endpoint for config".to_string(),
+        ));
     }
 
     let dir_id = state.client.get_type_dir_id(file_type).await?;
@@ -167,9 +177,9 @@ async fn list_files(
             size: f.size as u64,
         })
         .collect();
-    
+
     let body = serde_json::to_string(&entries)?;
-    
+
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, V2_CONTENT_TYPE)
@@ -190,7 +200,7 @@ async fn head_file(
         .ok_or_else(|| AppError::BadRequest(format!("Invalid type: {}", type_str)))?;
 
     let dir_id = state.client.get_type_dir_id(file_type).await?;
-    
+
     match state.client.get_file_info(dir_id, &name).await? {
         Some(file) => {
             let mut headers = HeaderMap::new();
@@ -208,7 +218,7 @@ async fn head_file(
 fn parse_range(header: &str, file_size: u64) -> Option<(u64, u64)> {
     let range_spec = header.strip_prefix("bytes=")?;
     let parts: Vec<&str> = range_spec.split('-').collect();
-    
+
     if parts.len() != 2 {
         return None;
     }
@@ -244,8 +254,11 @@ async fn get_file(
         .ok_or_else(|| AppError::BadRequest(format!("Invalid type: {}", type_str)))?;
 
     let dir_id = state.client.get_type_dir_id(file_type).await?;
-    
-    let file = state.client.get_file_info(dir_id, &name).await?
+
+    let file = state
+        .client
+        .get_file_info(dir_id, &name)
+        .await?
         .ok_or_else(|| AppError::NotFound(name.clone()))?;
 
     let file_size = file.size as u64;
@@ -258,10 +271,13 @@ async fn get_file(
 
     if let Some((start, end)) = range {
         // Use native range download from 123pan
-        let data = state.client.download_file(file.file_id, Some((start, end))).await?;
-        
+        let data = state
+            .client
+            .download_file(file.file_id, Some((start, end)))
+            .await?;
+
         let content_range = format!("bytes {}-{}/{}", start, end, file_size);
-        
+
         let mut resp_headers = HeaderMap::new();
         resp_headers.insert(
             header::CONTENT_TYPE,
@@ -271,10 +287,7 @@ async fn get_file(
             header::CONTENT_LENGTH,
             data.len().to_string().parse().unwrap(),
         );
-        resp_headers.insert(
-            header::CONTENT_RANGE,
-            content_range.parse().unwrap(),
-        );
+        resp_headers.insert(header::CONTENT_RANGE, content_range.parse().unwrap());
 
         Ok((StatusCode::PARTIAL_CONTENT, resp_headers, data).into_response())
     } else {
@@ -302,16 +315,17 @@ async fn post_file(
     body: axum::body::Body,
 ) -> Result<impl IntoResponse> {
     // Convert body to Bytes with 1GB limit
-    let body = axum::body::to_bytes(body, 1024 * 1024 * 1024).await
+    let body = axum::body::to_bytes(body, 1024 * 1024 * 1024)
+        .await
         .map_err(|e| AppError::BadRequest(format!("Failed to read request body: {}", e)))?;
-    
+
     let file_type = ResticFileType::from_str(&type_str)
         .ok_or_else(|| AppError::BadRequest(format!("Invalid type: {}", type_str)))?;
 
     tracing::info!("Uploading {}/{} ({} bytes)", type_str, name, body.len());
 
     let dir_id = state.client.get_type_dir_id(file_type).await?;
-    
+
     // With duplicate=2, upload will overwrite existing file atomically
     state.client.upload_file(dir_id, &name, body).await?;
 
@@ -329,7 +343,7 @@ async fn delete_file(
     tracing::info!("Deleting {}/{}", type_str, name);
 
     let dir_id = state.client.get_type_dir_id(file_type).await?;
-    
+
     // Idempotent: return OK even if file doesn't exist
     if let Some(file) = state.client.get_file_info(dir_id, &name).await? {
         state.client.delete_file(dir_id, file.file_id).await?;

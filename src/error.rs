@@ -12,10 +12,7 @@ use serde_json::json;
 pub enum AppError {
     /// 123pan API error
     #[error("123pan API error: {message}")]
-    Pan123Api {
-        code: i32,
-        message: String,
-    },
+    Pan123Api { code: i32, message: String },
 
     /// HTTP client error
     #[error("HTTP request failed: {0}")]

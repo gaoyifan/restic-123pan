@@ -42,8 +42,7 @@ async fn main() -> anyhow::Result<()> {
     client.warm_cache().await?;
 
     // Create router
-    let app = create_router(client)
-        .layer(TraceLayer::new_for_http());
+    let app = create_router(client).layer(TraceLayer::new_for_http());
 
     // Parse listen address
     let addr: SocketAddr = config.listen_addr.parse()?;

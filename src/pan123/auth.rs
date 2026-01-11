@@ -5,8 +5,8 @@ use parking_lot::RwLock;
 use reqwest::Client;
 use std::sync::Arc;
 
-use crate::error::{AppError, Result};
 use super::types::{AccessTokenData, AccessTokenRequest, ApiResponse};
+use crate::error::{AppError, Result};
 
 /// Base URL for 123pan Open Platform API.
 pub const BASE_URL: &str = "https://open-api.123pan.com";
@@ -127,9 +127,9 @@ impl TokenManager {
                 )));
             }
 
-            let data = api_response.data.ok_or_else(|| {
-                AppError::Auth("No data in access token response".to_string())
-            })?;
+            let data = api_response
+                .data
+                .ok_or_else(|| AppError::Auth("No data in access token response".to_string()))?;
 
             // Parse expiry time
             let expires_at = DateTime::parse_from_rfc3339(&data.expired_at)
@@ -151,7 +151,10 @@ impl TokenManager {
                 *token_guard = Some(token_info);
             }
 
-            tracing::info!("Successfully refreshed access token, expires at {}", expires_at);
+            tracing::info!(
+                "Successfully refreshed access token, expires at {}",
+                expires_at
+            );
 
             return Ok(data.access_token);
         }

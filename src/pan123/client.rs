@@ -1,14 +1,14 @@
 //! 123pan API client for file operations.
 
 use bytes::Bytes;
+use parking_lot::RwLock;
 use reqwest::multipart::{Form, Part};
 use std::collections::HashMap;
 use std::sync::Arc;
-use parking_lot::RwLock;
 
-use crate::error::{AppError, Result};
 use super::auth::{TokenManager, BASE_URL};
 use super::types::*;
+use crate::error::{AppError, Result};
 
 /// Client for interacting with 123pan API.
 #[derive(Clone)]
@@ -43,7 +43,7 @@ impl Pan123Client {
 
         for attempt in 0..=MAX_RETRIES {
             let token = self.token_manager.get_token().await?;
-            
+
             let response = self
                 .token_manager
                 .http_client()
@@ -54,7 +54,7 @@ impl Pan123Client {
                 .await?;
 
             let api_response: ApiResponse<T> = response.json().await?;
-            
+
             // Check for 429 rate limit error
             if api_response.code == 429 {
                 if attempt < MAX_RETRIES {
@@ -87,13 +87,16 @@ impl Pan123Client {
     /// Make an authenticated GET request without timeout.
     /// Used for file listing which can take a long time for large directories.
     /// Retries on 429 rate limit errors.
-    async fn get_no_timeout<T: serde::de::DeserializeOwned>(&self, url: &str) -> Result<ApiResponse<T>> {
+    async fn get_no_timeout<T: serde::de::DeserializeOwned>(
+        &self,
+        url: &str,
+    ) -> Result<ApiResponse<T>> {
         const MAX_RETRIES: usize = 3;
         const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
 
         for attempt in 0..=MAX_RETRIES {
             let token = self.token_manager.get_token().await?;
-            
+
             let response = self
                 .token_manager
                 .http_client()
@@ -105,7 +108,7 @@ impl Pan123Client {
                 .await?;
 
             let api_response: ApiResponse<T> = response.json().await?;
-            
+
             // Check for 429 rate limit error
             if api_response.code == 429 {
                 if attempt < MAX_RETRIES {
@@ -144,13 +147,13 @@ impl Pan123Client {
     ) -> Result<ApiResponse<T>> {
         const MAX_RETRIES: usize = 3;
         const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
-        
+
         // Serialize body once for reuse in retries
         let body_json = serde_json::to_string(body)?;
 
         for attempt in 0..=MAX_RETRIES {
             let token = self.token_manager.get_token().await?;
-            
+
             let response = self
                 .token_manager
                 .http_client()
@@ -163,7 +166,7 @@ impl Pan123Client {
                 .await?;
 
             let api_response: ApiResponse<T> = response.json().await?;
-            
+
             // Check for 429 rate limit error
             if api_response.code == 429 {
                 if attempt < MAX_RETRIES {
@@ -215,7 +218,7 @@ impl Pan123Client {
 
         for attempt in 0..=MAX_RETRIES {
             let token = self.token_manager.get_token().await?;
-            
+
             let response = self
                 .token_manager
                 .http_client()
@@ -257,13 +260,14 @@ impl Pan123Client {
                 });
             }
 
-            let domains = api_response.data.ok_or_else(|| {
-                AppError::Internal("No upload domain in response".to_string())
-            })?;
+            let domains = api_response
+                .data
+                .ok_or_else(|| AppError::Internal("No upload domain in response".to_string()))?;
 
-            let domain = domains.into_iter().next().ok_or_else(|| {
-                AppError::Internal("Empty upload domain list".to_string())
-            })?;
+            let domain = domains
+                .into_iter()
+                .next()
+                .ok_or_else(|| AppError::Internal("Empty upload domain list".to_string()))?;
 
             tracing::info!("Fetched upload domain: {}", domain);
 
@@ -290,7 +294,11 @@ impl Pan123Client {
         {
             let cache = self.files_cache.read();
             if let Some(files) = cache.get(&parent_id) {
-                tracing::debug!("Cache hit for parent_id {}: {} files", parent_id, files.len());
+                tracing::debug!(
+                    "Cache hit for parent_id {}: {} files",
+                    parent_id,
+                    files.len()
+                );
                 return Ok(files.clone());
             }
         }
@@ -319,7 +327,7 @@ impl Pan123Client {
                 "{}/api/v2/file/list?parentFileId={}&limit=100",
                 BASE_URL, parent_id
             );
-            
+
             if let Some(id) = last_file_id {
                 url.push_str(&format!("&lastFileId={}", id));
             }
@@ -335,10 +343,12 @@ impl Pan123Client {
 
             if let Some(data) = response.data {
                 // Filter out trashed files
-                let files: Vec<_> = data.file_list.into_iter()
+                let files: Vec<_> = data
+                    .file_list
+                    .into_iter()
                     .filter(|f| !f.is_trashed())
                     .collect();
-                
+
                 all_files.extend(files);
                 page_count += 1;
 
@@ -394,19 +404,37 @@ impl Pan123Client {
         let response: ApiResponse<CreateDirData> = self.post(&url, &request).await?;
 
         if !response.is_success() {
-            tracing::debug!("mkdir failed: code={}, message='{}'", response.code, response.message);
+            tracing::debug!(
+                "mkdir failed: code={}, message='{}'",
+                response.code,
+                response.message
+            );
             // Code 1: directory already exists (message: 该目录下已经有同名文件夹,无法进行创建)
             if response.code == 1 && response.message.contains("同名") {
-                tracing::debug!("Directory '{}' already exists, looking up its ID via list_files", name);
+                tracing::debug!(
+                    "Directory '{}' already exists, looking up its ID via list_files",
+                    name
+                );
                 // Invalidate cache first since it might be stale
                 self.invalidate_files_cache(parent_id);
                 // Search mode has index delay, use list_files instead
                 let files = self.list_files(parent_id).await?;
-                if let Some(file) = files.into_iter().find(|f| f.filename == name && f.is_folder()) {
-                    tracing::debug!("Found directory '{}' with id {}", file.filename, file.file_id);
+                if let Some(file) = files
+                    .into_iter()
+                    .find(|f| f.filename == name && f.is_folder())
+                {
+                    tracing::debug!(
+                        "Found directory '{}' with id {}",
+                        file.filename,
+                        file.file_id
+                    );
                     return Ok(file.file_id);
                 } else {
-                    tracing::debug!("Directory '{}' not found in list for parent {}", name, parent_id);
+                    tracing::debug!(
+                        "Directory '{}' not found in list for parent {}",
+                        name,
+                        parent_id
+                    );
                 }
             }
             return Err(AppError::Pan123Api {
@@ -415,9 +443,9 @@ impl Pan123Client {
             });
         }
 
-        let data = response.data.ok_or_else(|| {
-            AppError::Internal("No data in mkdir response".to_string())
-        })?;
+        let data = response
+            .data
+            .ok_or_else(|| AppError::Internal("No data in mkdir response".to_string()))?;
 
         // Add newly created directory to cache if cache exists
         {
@@ -432,7 +460,11 @@ impl Pan123Client {
                     trashed: 0,
                 };
                 files.push(new_dir);
-                tracing::debug!("Added new directory '{}' to cache (id={})", name, data.dir_id);
+                tracing::debug!(
+                    "Added new directory '{}' to cache (id={})",
+                    name,
+                    data.dir_id
+                );
             }
         }
 
@@ -530,14 +562,15 @@ impl Pan123Client {
                     continue;
                 } else {
                     return Err(AppError::Internal(format!(
-                        "Path component '{}' exists but is not a directory", part
+                        "Path component '{}' exists but is not a directory",
+                        part
                     )));
                 }
             }
 
             // Create the directory
             current_id = self.create_directory(current_id, part).await?;
-            
+
             // Update cache
             {
                 let mut cache = self.dir_cache.write();
@@ -567,14 +600,14 @@ impl Pan123Client {
     /// Uses duplicate=2 to overwrite existing files atomically.
     /// Updates the files cache if it exists for the parent directory.
     /// Includes 429 retry support.
-    pub async fn upload_file(
-        &self,
-        parent_id: i64,
-        filename: &str,
-        data: Bytes,
-    ) -> Result<i64> {
+    pub async fn upload_file(&self, parent_id: i64, filename: &str, data: Bytes) -> Result<i64> {
         let file_size = data.len() as i64;
-        tracing::debug!("Uploading file '{}' ({} bytes) to parent {}", filename, file_size, parent_id);
+        tracing::debug!(
+            "Uploading file '{}' ({} bytes) to parent {}",
+            filename,
+            file_size,
+            parent_id
+        );
 
         // Calculate MD5 hash
         let md5_hash = format!("{:x}", md5::compute(&data));
@@ -597,7 +630,10 @@ impl Pan123Client {
                 .text("etag", md5_hash.clone())
                 .text("size", file_size.to_string())
                 .text("duplicate", "2") // Overwrite existing file atomically
-                .part("file", Part::bytes(data_vec.clone()).file_name(filename.to_string()));
+                .part(
+                    "file",
+                    Part::bytes(data_vec.clone()).file_name(filename.to_string()),
+                );
 
             let response = self
                 .token_manager
@@ -611,7 +647,7 @@ impl Pan123Client {
 
             let status = response.status();
             let text = response.text().await?;
-            
+
             tracing::debug!("Upload response status: {}, body: {}", status, text);
 
             let api_response: ApiResponse<SingleUploadData> = serde_json::from_str(&text)?;
@@ -648,9 +684,9 @@ impl Pan123Client {
                 });
             }
 
-            let upload_data = api_response.data.ok_or_else(|| {
-                AppError::Internal("No data in upload response".to_string())
-            })?;
+            let upload_data = api_response
+                .data
+                .ok_or_else(|| AppError::Internal("No data in upload response".to_string()))?;
 
             if !upload_data.completed {
                 return Err(AppError::Internal("Upload not completed".to_string()));
@@ -667,7 +703,12 @@ impl Pan123Client {
                         // Update existing entry
                         existing.file_id = file_id;
                         existing.size = file_size;
-                        tracing::debug!("Updated existing file '{}' in cache (id={}, size={})", filename, file_id, file_size);
+                        tracing::debug!(
+                            "Updated existing file '{}' in cache (id={}, size={})",
+                            filename,
+                            file_id,
+                            file_size
+                        );
                     } else {
                         // Add new entry
                         let new_file = FileInfo {
@@ -679,7 +720,12 @@ impl Pan123Client {
                             trashed: 0,
                         };
                         files.push(new_file);
-                        tracing::debug!("Added new file '{}' to cache (id={}, size={})", filename, file_id, file_size);
+                        tracing::debug!(
+                            "Added new file '{}' to cache (id={}, size={})",
+                            filename,
+                            file_id,
+                            file_size
+                        );
                     }
                 }
             }
@@ -706,9 +752,9 @@ impl Pan123Client {
             });
         }
 
-        let data = response.data.ok_or_else(|| {
-            AppError::Internal("No data in download info response".to_string())
-        })?;
+        let data = response
+            .data
+            .ok_or_else(|| AppError::Internal("No data in download info response".to_string()))?;
 
         Ok(data.download_url)
     }
@@ -719,7 +765,7 @@ impl Pan123Client {
         let download_url = self.get_download_url(file_id).await?;
 
         let mut request = self.token_manager.http_client().get(&download_url);
-        
+
         // Pass Range header to 123pan for native range support
         if let Some((start, end)) = range {
             request = request.header("Range", format!("bytes={}-{}", start, end));
@@ -762,7 +808,11 @@ impl Pan123Client {
     /// Permanently delete a file (must be in trash first).
     /// Updates the files cache if it exists for the parent directory.
     pub async fn delete_file(&self, parent_id: i64, file_id: i64) -> Result<()> {
-        tracing::debug!("Permanently deleting file {} from parent {}", file_id, parent_id);
+        tracing::debug!(
+            "Permanently deleting file {} from parent {}",
+            file_id,
+            parent_id
+        );
 
         // First move to trash
         self.trash_file(file_id).await?;
@@ -790,7 +840,11 @@ impl Pan123Client {
                 let original_len = files.len();
                 files.retain(|f| f.file_id != file_id);
                 if files.len() < original_len {
-                    tracing::debug!("Removed file {} from cache for parent {}", file_id, parent_id);
+                    tracing::debug!(
+                        "Removed file {} from cache for parent {}",
+                        file_id,
+                        parent_id
+                    );
                 }
             }
         }
@@ -867,7 +921,10 @@ impl Pan123Client {
                 let files = self.list_files(dir_id).await?;
                 tracing::info!("Cached {} files in /{}", files.len(), file_type.dirname());
             } else {
-                tracing::debug!("Directory /{} does not exist, skipping", file_type.dirname());
+                tracing::debug!(
+                    "Directory /{} does not exist, skipping",
+                    file_type.dirname()
+                );
             }
         }
 

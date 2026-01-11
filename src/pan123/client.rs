@@ -84,6 +84,57 @@ impl Pan123Client {
         unreachable!()
     }
 
+    /// Make an authenticated GET request without timeout.
+    /// Used for file listing which can take a long time for large directories.
+    /// Retries on 429 rate limit errors.
+    async fn get_no_timeout<T: serde::de::DeserializeOwned>(&self, url: &str) -> Result<ApiResponse<T>> {
+        const MAX_RETRIES: usize = 3;
+        const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+
+        for attempt in 0..=MAX_RETRIES {
+            let token = self.token_manager.get_token().await?;
+            
+            let response = self
+                .token_manager
+                .http_client()
+                .get(url)
+                .timeout(std::time::Duration::MAX) // No timeout
+                .header("Authorization", format!("Bearer {}", token))
+                .header("Platform", "open_platform")
+                .send()
+                .await?;
+
+            let api_response: ApiResponse<T> = response.json().await?;
+            
+            // Check for 429 rate limit error
+            if api_response.code == 429 {
+                if attempt < MAX_RETRIES {
+                    tracing::warn!(
+                        "Rate limited (429), waiting {}s before retry (attempt {}/{})",
+                        RETRY_DELAY.as_secs(),
+                        attempt + 1,
+                        MAX_RETRIES
+                    );
+                    tokio::time::sleep(RETRY_DELAY).await;
+                    continue;
+                } else {
+                    tracing::error!(
+                        "Rate limited (429) after {} retries, giving up",
+                        MAX_RETRIES
+                    );
+                    return Err(AppError::Pan123Api {
+                        code: api_response.code,
+                        message: api_response.message,
+                    });
+                }
+            }
+
+            return Ok(api_response);
+        }
+
+        unreachable!()
+    }
+
     /// Make an authenticated POST request with JSON body and 429 retry support.
     /// Retries up to 3 times with 1 second delay on 429 rate limit errors.
     async fn post<T: serde::de::DeserializeOwned, B: serde::Serialize>(
@@ -257,9 +308,11 @@ impl Pan123Client {
     }
 
     /// Fetch files from 123pan API (internal, bypasses cache).
+    /// Uses no timeout to handle large directories with hundreds of thousands of files.
     async fn fetch_files_from_api(&self, parent_id: i64) -> Result<Vec<FileInfo>> {
         let mut all_files = Vec::new();
         let mut last_file_id: Option<i64> = None;
+        let mut page_count = 0;
 
         loop {
             let mut url = format!(
@@ -271,7 +324,7 @@ impl Pan123Client {
                 url.push_str(&format!("&lastFileId={}", id));
             }
 
-            let response: ApiResponse<FileListData> = self.get(&url).await?;
+            let response: ApiResponse<FileListData> = self.get_no_timeout(&url).await?;
 
             if !response.is_success() {
                 return Err(AppError::Pan123Api {
@@ -287,6 +340,16 @@ impl Pan123Client {
                     .collect();
                 
                 all_files.extend(files);
+                page_count += 1;
+
+                // Log progress for large directories
+                if page_count % 100 == 0 {
+                    tracing::info!(
+                        "Fetched {} files so far (parent_id={})",
+                        all_files.len(),
+                        parent_id
+                    );
+                }
 
                 if data.last_file_id == -1 {
                     break;
@@ -761,6 +824,54 @@ impl Pan123Client {
         }
 
         tracing::info!("Repository initialized successfully");
+        Ok(())
+    }
+
+    /// Warm up the cache by pre-fetching all directory IDs and file listings.
+    /// This should be called during startup before the server starts accepting requests.
+    pub async fn warm_cache(&self) -> Result<()> {
+        let start = std::time::Instant::now();
+        tracing::info!("Starting cache warm-up for repository: {}", self.repo_path);
+
+        // First, check if repo path exists and cache its ID
+        let repo_id = match self.find_path_id(&self.repo_path).await? {
+            Some(id) => {
+                tracing::info!("Repository path found with id {}", id);
+                id
+            }
+            None => {
+                tracing::warn!(
+                    "Repository path {} does not exist yet, skipping cache warm-up",
+                    self.repo_path
+                );
+                return Ok(());
+            }
+        };
+
+        // Pre-fetch file listing for repo root
+        let root_files = self.list_files(repo_id).await?;
+        tracing::info!("Cached {} items at repository root", root_files.len());
+
+        // Pre-fetch each restic file type directory
+        let file_types = [
+            ResticFileType::Data,
+            ResticFileType::Keys,
+            ResticFileType::Locks,
+            ResticFileType::Snapshots,
+            ResticFileType::Index,
+        ];
+
+        for file_type in file_types {
+            let path = format!("{}/{}", self.repo_path, file_type.dirname());
+            if let Some(dir_id) = self.find_path_id(&path).await? {
+                let files = self.list_files(dir_id).await?;
+                tracing::info!("Cached {} files in /{}", files.len(), file_type.dirname());
+            } else {
+                tracing::debug!("Directory /{} does not exist, skipping", file_type.dirname());
+            }
+        }
+
+        tracing::info!("Cache warm-up completed in {:?}", start.elapsed());
         Ok(())
     }
 }

@@ -37,6 +37,10 @@ async fn main() -> anyhow::Result<()> {
         config.repo_path.clone(),
     );
 
+    // Warm up the cache before starting the server
+    tracing::info!("Warming up file list cache...");
+    client.warm_cache().await?;
+
     // Create router
     let app = create_router(client)
         .layer(TraceLayer::new_for_http());

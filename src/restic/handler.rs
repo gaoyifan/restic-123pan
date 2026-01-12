@@ -166,8 +166,13 @@ async fn list_files(
         ));
     }
 
-    let dir_id = state.client.get_type_dir_id(file_type).await?;
-    let files = state.client.list_files(dir_id).await?;
+    // For data files, use the aggregated listing across all subdirectories
+    let files = if file_type == ResticFileType::Data {
+        state.client.list_all_data_files().await?
+    } else {
+        let dir_id = state.client.get_type_dir_id(file_type).await?;
+        state.client.list_files(dir_id).await?
+    };
 
     // Always return v2 format (name + size)
     let entries: Vec<FileEntryV2> = files
@@ -199,7 +204,12 @@ async fn head_file(
     let file_type = ResticFileType::from_str(&type_str)
         .ok_or_else(|| AppError::BadRequest(format!("Invalid type: {}", type_str)))?;
 
-    let dir_id = state.client.get_type_dir_id(file_type).await?;
+    // For data files, use the subdirectory based on filename prefix
+    let dir_id = if file_type == ResticFileType::Data {
+        state.client.get_data_file_dir_id(&name).await?
+    } else {
+        state.client.get_type_dir_id(file_type).await?
+    };
 
     match state.client.get_file_info(dir_id, &name).await? {
         Some(file) => {
@@ -253,7 +263,12 @@ async fn get_file(
     let file_type = ResticFileType::from_str(&type_str)
         .ok_or_else(|| AppError::BadRequest(format!("Invalid type: {}", type_str)))?;
 
-    let dir_id = state.client.get_type_dir_id(file_type).await?;
+    // For data files, use the subdirectory based on filename prefix
+    let dir_id = if file_type == ResticFileType::Data {
+        state.client.get_data_file_dir_id(&name).await?
+    } else {
+        state.client.get_type_dir_id(file_type).await?
+    };
 
     let file = state
         .client
@@ -324,7 +339,12 @@ async fn post_file(
 
     tracing::info!("Uploading {}/{} ({} bytes)", type_str, name, body.len());
 
-    let dir_id = state.client.get_type_dir_id(file_type).await?;
+    // For data files, use the subdirectory based on filename prefix
+    let dir_id = if file_type == ResticFileType::Data {
+        state.client.get_data_file_dir_id(&name).await?
+    } else {
+        state.client.get_type_dir_id(file_type).await?
+    };
 
     // With duplicate=2, upload will overwrite existing file atomically
     state.client.upload_file(dir_id, &name, body).await?;
@@ -342,7 +362,12 @@ async fn delete_file(
 
     tracing::info!("Deleting {}/{}", type_str, name);
 
-    let dir_id = state.client.get_type_dir_id(file_type).await?;
+    // For data files, use the subdirectory based on filename prefix
+    let dir_id = if file_type == ResticFileType::Data {
+        state.client.get_data_file_dir_id(&name).await?
+    } else {
+        state.client.get_type_dir_id(file_type).await?
+    };
 
     // Idempotent: return OK even if file doesn't exist
     if let Some(file) = state.client.get_file_info(dir_id, &name).await? {

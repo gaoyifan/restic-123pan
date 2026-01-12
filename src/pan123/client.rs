@@ -581,6 +581,22 @@ impl Pan123Client {
         Ok(current_id)
     }
 
+    /// Extract the 2-character prefix from a filename for data subdirectory.
+    /// Data files in restic are named by their hash, so the first 2 characters
+    /// are used to create subdirectories for better listing performance.
+    fn data_subdir_prefix(filename: &str) -> &str {
+        // Data files are always hex hashes with at least 2 characters
+        &filename[..2.min(filename.len())]
+    }
+
+    /// Get the directory ID for a data file, creating the 2-char subdirectory if needed.
+    /// Data files are stored in `{repo_path}/data/{prefix}/` where prefix is the first 2 chars.
+    pub async fn get_data_file_dir_id(&self, filename: &str) -> Result<i64> {
+        let prefix = Self::data_subdir_prefix(filename);
+        let path = format!("{}/data/{}", self.repo_path, prefix);
+        self.ensure_path(&path).await
+    }
+
     /// Get the directory ID for a restic file type.
     pub async fn get_type_dir_id(&self, file_type: ResticFileType) -> Result<i64> {
         if file_type.is_config() {
@@ -853,6 +869,39 @@ impl Pan123Client {
         Ok(())
     }
 
+    /// Move files to a different directory.
+    /// Supports up to 100 files per call (API limitation).
+    pub async fn move_files(&self, file_ids: Vec<i64>, to_parent_id: i64) -> Result<()> {
+        if file_ids.is_empty() {
+            return Ok(());
+        }
+
+        tracing::debug!(
+            "Moving {} files to parent {}",
+            file_ids.len(),
+            to_parent_id
+        );
+
+        let request = MoveRequest {
+            file_ids: file_ids.clone(),
+            to_parent_file_id: to_parent_id,
+        };
+
+        let response: ApiResponse<()> = self
+            .post(&format!("{}/api/v1/file/move", BASE_URL), &request)
+            .await?;
+
+        if !response.is_success() {
+            return Err(AppError::Pan123Api {
+                code: response.code,
+                message: response.message,
+            });
+        }
+
+        tracing::info!("Moved {} files to parent {}", file_ids.len(), to_parent_id);
+        Ok(())
+    }
+
     /// Check if a file exists and get its info using precise search.
     pub async fn get_file_info(&self, parent_id: i64, filename: &str) -> Result<Option<FileInfo>> {
         self.find_file(parent_id, filename).await
@@ -907,8 +956,28 @@ impl Pan123Client {
         tracing::info!("Cached {} items at repository root", root_files.len());
 
         // Pre-fetch each restic file type directory
+        // For data directory, we need to cache all subdirectories
+        let data_path = format!("{}/data", self.repo_path);
+        if let Some(data_dir_id) = self.find_path_id(&data_path).await? {
+            let data_subdirs = self.list_files(data_dir_id).await?;
+            tracing::info!("Cached /data directory: {} subdirectories", data_subdirs.iter().filter(|f| f.is_folder()).count());
+            let mut total_data_files = 0;
+            for subdir in data_subdirs.iter().filter(|f| f.is_folder()) {
+                let subdir_files = self.list_files(subdir.file_id).await?;
+                tracing::info!("Cached /data/{}: {} files", subdir.filename, subdir_files.len());
+                total_data_files += subdir_files.len();
+            }
+            tracing::info!(
+                "Cached {} data files across {} subdirectories",
+                total_data_files,
+                data_subdirs.iter().filter(|f| f.is_folder()).count()
+            );
+        } else {
+            tracing::debug!("Directory /data does not exist, skipping");
+        }
+
+        // Pre-fetch other file type directories (not data, which is handled above)
         let file_types = [
-            ResticFileType::Data,
             ResticFileType::Keys,
             ResticFileType::Locks,
             ResticFileType::Snapshots,
@@ -930,6 +999,28 @@ impl Pan123Client {
 
         tracing::info!("Cache warm-up completed in {:?}", start.elapsed());
         Ok(())
+    }
+
+    /// List all data files across all 2-char subdirectories.
+    /// Returns aggregated file list from all subdirectories under data/.
+    pub async fn list_all_data_files(&self) -> Result<Vec<FileInfo>> {
+        let data_path = format!("{}/data", self.repo_path);
+        let data_dir_id = match self.find_path_id(&data_path).await? {
+            Some(id) => id,
+            None => return Ok(Vec::new()),
+        };
+
+        // List all subdirectories in data/
+        let subdirs = self.list_files(data_dir_id).await?;
+
+        // Collect files from each subdirectory
+        let mut all_files = Vec::new();
+        for subdir in subdirs.iter().filter(|f| f.is_folder()) {
+            let subdir_files = self.list_files(subdir.file_id).await?;
+            all_files.extend(subdir_files.into_iter().filter(|f| !f.is_folder()));
+        }
+
+        Ok(all_files)
     }
 }
 

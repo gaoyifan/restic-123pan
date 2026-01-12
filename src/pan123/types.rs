@@ -116,6 +116,16 @@ pub struct DeleteRequest {
     pub file_ids: Vec<i64>,
 }
 
+/// Request body for moving files to a different directory.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MoveRequest {
+    #[serde(rename = "fileIDs")]
+    pub file_ids: Vec<i64>,
+    #[serde(rename = "toParentFileID")]
+    pub to_parent_file_id: i64,
+}
+
 /// Response data for single file upload.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]

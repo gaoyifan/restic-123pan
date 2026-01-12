@@ -447,9 +447,11 @@ impl Pan123Client {
             .data
             .ok_or_else(|| AppError::Internal("No data in mkdir response".to_string()))?;
 
-        // Add newly created directory to cache if cache exists
+        // Add newly created directory to parent's cache AND initialize new directory's cache
         {
             let mut cache = self.files_cache.write();
+            
+            // Add to parent's cache if it exists
             if let Some(files) = cache.get_mut(&parent_id) {
                 let new_dir = FileInfo {
                     file_id: data.dir_id,
@@ -461,11 +463,21 @@ impl Pan123Client {
                 };
                 files.push(new_dir);
                 tracing::debug!(
-                    "Added new directory '{}' to cache (id={})",
+                    "Added new directory '{}' to parent cache (id={})",
                     name,
                     data.dir_id
                 );
             }
+            
+            // Initialize the new directory's cache as empty
+            // This is critical: subsequent uploads to this directory will add to this cache,
+            // avoiding issues with 123pan API indexing delays
+            cache.insert(data.dir_id, Vec::new());
+            tracing::debug!(
+                "Initialized empty cache for new directory '{}' (id={})",
+                name,
+                data.dir_id
+            );
         }
 
         tracing::info!("Created directory '{}' with id {}", name, data.dir_id);

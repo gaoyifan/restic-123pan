@@ -1,0 +1,2 @@
+- [  ] 每次触发 token refresh 时，将新的 access token 和 refresh token 存入 SQLite 数据库。启动时优先使用 SQLite 中的凭证，如果SQLite不存在才从环境变量中读取
+- [  ] 整个缓存也写入 SQLite，而不是依赖内存。且将 SQLite 作为唯一的缓存数据来源，移除内存中的缓存。

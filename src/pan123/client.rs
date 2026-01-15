@@ -35,7 +35,10 @@ impl Pan123Client {
         repo_path: String,
         database_url: &str,
     ) -> Result<Self> {
-        let db = Database::connect(database_url)
+        let mut opt = ConnectOptions::new(database_url.to_owned());
+        opt.sqlx_logging_level(log::LevelFilter::Debug);
+
+        let db = Database::connect(opt)
             .await
             .map_err(|e| AppError::Internal(format!("Failed to connect to database: {}", e)))?;
 

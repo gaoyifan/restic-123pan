@@ -46,6 +46,7 @@ fn start_server(client_id: &str, client_secret: &str, port: u16, repo_path: &str
         .env("PAN123_CLIENT_SECRET", client_secret)
         .env("PAN123_REPO_PATH", repo_path)
         .env("LISTEN_ADDR", format!("127.0.0.1:{}", port))
+        .env("DATABASE_URL", format!("sqlite:cache_{}.db?mode=rwc", port))
         .env("RUST_LOG", "info")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

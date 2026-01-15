@@ -35,11 +35,13 @@ async fn main() -> anyhow::Result<()> {
         config.client_id.clone(),
         config.client_secret.clone(),
         config.repo_path.clone(),
-    );
+        &config.database_url,
+    )
+    .await?;
 
     // Warm up the cache before starting the server
-    tracing::info!("Warming up file list cache...");
-    client.warm_cache().await?;
+    tracing::info!("Checking file list cache...");
+    client.warm_cache(config.force_cache_rebuild).await?;
 
     // Create router
     let app = create_router(client).layer(TraceLayer::new_for_http());

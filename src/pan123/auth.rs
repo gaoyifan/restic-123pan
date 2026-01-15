@@ -3,6 +3,10 @@
 use chrono::{DateTime, Duration, Utc};
 use parking_lot::RwLock;
 use reqwest::Client;
+use sea_orm::{
+    sea_query::{ColumnDef, Expr, OnConflict, Query, Table},
+    ConnectionTrait, DatabaseConnection,
+};
 use std::sync::Arc;
 
 use super::types::{AccessTokenData, AccessTokenRequest, ApiResponse};
@@ -31,12 +35,18 @@ pub struct TokenManager {
     client_id: String,
     client_secret: String,
     http_client: Client,
+    db: DatabaseConnection,
     token: Arc<RwLock<Option<TokenInfo>>>,
 }
 
+const TOKEN_CACHE_TABLE: &str = "token_cache";
+const TOKEN_CACHE_ID: &str = "id";
+const TOKEN_CACHE_ACCESS_TOKEN: &str = "access_token";
+const TOKEN_CACHE_EXPIRES_AT: &str = "expires_at";
+
 impl TokenManager {
     /// Create a new token manager.
-    pub fn new(client_id: String, client_secret: String) -> Self {
+    pub fn new(client_id: String, client_secret: String, db: DatabaseConnection) -> Self {
         let http_client = Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()
@@ -46,8 +56,36 @@ impl TokenManager {
             client_id,
             client_secret,
             http_client,
+            db,
             token: Arc::new(RwLock::new(None)),
         }
+    }
+
+    /// Initialize token cache table.
+    pub async fn init_db(&self) -> Result<()> {
+        let builder = self.db.get_database_backend();
+        let stmt = Table::create()
+            .table(TOKEN_CACHE_TABLE)
+            .if_not_exists()
+            .col(
+                ColumnDef::new(TOKEN_CACHE_ID)
+                    .integer()
+                    .not_null()
+                    .primary_key(),
+            )
+            .col(
+                ColumnDef::new(TOKEN_CACHE_ACCESS_TOKEN)
+                    .string()
+                    .not_null(),
+            )
+            .col(ColumnDef::new(TOKEN_CACHE_EXPIRES_AT).string().not_null())
+            .to_owned();
+
+        self.db.execute(builder.build(&stmt)).await.map_err(|e| {
+            AppError::Internal(format!("Failed to initialize token cache table: {}", e))
+        })?;
+
+        Ok(())
     }
 
     /// Get a valid access token, refreshing if necessary.
@@ -60,6 +98,13 @@ impl TokenManager {
                     return Ok(token_info.access_token.clone());
                 }
             }
+        }
+
+        // Check cached token in DB
+        if let Some(token_info) = self.load_cached_token().await? {
+            let mut token_guard = self.token.write();
+            *token_guard = Some(token_info.clone());
+            return Ok(token_info.access_token);
         }
 
         // Need to refresh token
@@ -148,8 +193,10 @@ impl TokenManager {
             // Update stored token
             {
                 let mut token_guard = self.token.write();
-                *token_guard = Some(token_info);
+                *token_guard = Some(token_info.clone());
             }
+
+            self.store_cached_token(&token_info).await?;
 
             tracing::info!(
                 "Successfully refreshed access token, expires at {}",
@@ -165,6 +212,79 @@ impl TokenManager {
     /// Get the HTTP client.
     pub fn http_client(&self) -> &Client {
         &self.http_client
+    }
+
+    async fn load_cached_token(&self) -> Result<Option<TokenInfo>> {
+        let builder = self.db.get_database_backend();
+        let stmt = Query::select()
+            .columns([TOKEN_CACHE_ACCESS_TOKEN, TOKEN_CACHE_EXPIRES_AT])
+            .from(TOKEN_CACHE_TABLE)
+            .and_where(Expr::col(TOKEN_CACHE_ID).eq(1))
+            .to_owned();
+
+        let row = self
+            .db
+            .query_one(builder.build(&stmt))
+            .await
+            .map_err(|e| AppError::Internal(format!("Failed to query token cache: {}", e)))?;
+
+        let Some(row) = row else {
+            return Ok(None);
+        };
+
+        let access_token: String = row
+            .try_get("", TOKEN_CACHE_ACCESS_TOKEN)
+            .map_err(|e| AppError::Internal(format!("Failed to read cached token: {}", e)))?;
+        let expires_at_str: String = row
+            .try_get("", TOKEN_CACHE_EXPIRES_AT)
+            .map_err(|e| AppError::Internal(format!("Failed to read cached expiry: {}", e)))?;
+
+        let expires_at = match DateTime::parse_from_rfc3339(&expires_at_str) {
+            Ok(dt) => dt.with_timezone(&Utc),
+            Err(_) => {
+                tracing::warn!("Cached token expiry parse failed, ignoring cache");
+                return Ok(None);
+            }
+        };
+
+        let token_info = TokenInfo {
+            access_token,
+            expires_at,
+        };
+
+        if token_info.is_expired() {
+            return Ok(None);
+        }
+
+        Ok(Some(token_info))
+    }
+
+    async fn store_cached_token(&self, token_info: &TokenInfo) -> Result<()> {
+        let builder = self.db.get_database_backend();
+        let stmt = Query::insert()
+            .into_table(TOKEN_CACHE_TABLE)
+            .columns([
+                TOKEN_CACHE_ID,
+                TOKEN_CACHE_ACCESS_TOKEN,
+                TOKEN_CACHE_EXPIRES_AT,
+            ])
+            .values_panic([
+                1.into(),
+                token_info.access_token.clone().into(),
+                token_info.expires_at.to_rfc3339().into(),
+            ])
+            .on_conflict(
+                OnConflict::column(TOKEN_CACHE_ID)
+                    .update_columns([TOKEN_CACHE_ACCESS_TOKEN, TOKEN_CACHE_EXPIRES_AT])
+                    .to_owned(),
+            )
+            .to_owned();
+
+        self.db.execute(builder.build(&stmt)).await.map_err(|e| {
+            AppError::Internal(format!("Failed to upsert token cache: {}", e))
+        })?;
+
+        Ok(())
     }
 }
 

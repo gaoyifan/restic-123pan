@@ -26,6 +26,14 @@ pub struct Config {
     /// Log level (trace, debug, info, warn, error)
     #[arg(long, env = "RUST_LOG", default_value = "info")]
     pub log_level: String,
+
+    /// SQLite database URL for persistent cache
+    #[arg(long, env = "DATABASE_URL", default_value = "sqlite:cache.db?mode=rwc")]
+    pub database_url: String,
+
+    /// Force rebuild of the file list cache on startup
+    #[arg(long, env = "FORCE_CACHE_REBUILD", default_value = "false")]
+    pub force_cache_rebuild: bool,
 }
 
 impl Config {

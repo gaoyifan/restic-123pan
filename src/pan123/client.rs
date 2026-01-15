@@ -520,7 +520,10 @@ impl Pan123Client {
                     })?;
                 }
 
-                if let Some(existing) = files.into_iter().find(|f| f.filename == name && f.is_folder()) {
+                if let Some(existing) = files
+                    .into_iter()
+                    .find(|f| f.filename == name && f.is_folder())
+                {
                     tracing::info!(
                         "Directory '{}' already exists with id {} (refreshed)",
                         name,
@@ -771,15 +774,15 @@ impl Pan123Client {
                     entity::Column::ParentId,
                     entity::Column::Name,
                 ])
-                    .update_columns([
-                        entity::Column::FileId,
-                        entity::Column::ParentId,
-                        entity::Column::Name,
-                        entity::Column::Size,
-                        entity::Column::Etag,
-                        entity::Column::UpdatedAt,
-                    ])
-                    .to_owned(),
+                .update_columns([
+                    entity::Column::FileId,
+                    entity::Column::ParentId,
+                    entity::Column::Name,
+                    entity::Column::Size,
+                    entity::Column::Etag,
+                    entity::Column::UpdatedAt,
+                ])
+                .to_owned(),
             )
             .exec(&self.db)
             .await
@@ -924,7 +927,7 @@ impl Pan123Client {
         // Sync with DB: update parent_id for all moved files
         entity::Entity::update_many()
             .col_expr(entity::Column::ParentId, Expr::value(to_parent_id))
-            .filter(entity::Column::FileId.is_in(file_ids))
+            .filter(entity::Column::FileId.is_in(file_ids.clone()))
             .exec(&self.db)
             .await
             .map_err(|e| {
@@ -1097,7 +1100,8 @@ impl Pan123Client {
         // Find data directory ID
         let Some(data_dir_id) = self
             .find_path_id(&format!("{}/data", self.repo_path))
-            .await? else {
+            .await?
+        else {
             return Ok(Vec::new());
         };
 

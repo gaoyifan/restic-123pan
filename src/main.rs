@@ -30,12 +30,21 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Repository path: {}", config.repo_path);
     tracing::info!("Listen address: {}", config.listen_addr);
 
+    // Ensure database directory exists
+    let db_path = std::path::Path::new(&config.db_path);
+    if let Some(parent) = db_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let database_url = format!("sqlite:{}?mode=rwc", config.db_path);
+
     // Create 123pan client
     let client = Pan123Client::new(
         config.client_id.clone(),
         config.client_secret.clone(),
         config.repo_path.clone(),
-        &config.database_url,
+        &database_url,
     )
     .await?;
 

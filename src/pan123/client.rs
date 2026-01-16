@@ -43,6 +43,11 @@ macro_rules! retry_api {
                 }
             };
 
+            // Log full response if it's an error
+            if !api_response.is_success() {
+                tracing::warn!("123pan API error response: {}", text);
+            }
+
             // Check for 429 rate limit error
             if api_response.code == 429 {
                 if attempt < MAX_RETRIES {

@@ -12,5 +12,6 @@ services:
       - PAN123_REPO_PATH=${PAN123_REPO_PATH:-/restic-backup}
       - LISTEN_ADDR=${LISTEN_ADDR:-0.0.0.0:8000}
       - RUST_LOG=${RUST_LOG:-info}
+      - DB_PATH=${DB_PATH:-cache/cache-123pan.db}
     volumes:
-      - ./config:/app/config
+      - ./cache:/app/cache

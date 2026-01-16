@@ -1,4 +1,6 @@
 /target
 .env
 *.db
-config/
+*.db-shm
+*.db-wal
+/cache

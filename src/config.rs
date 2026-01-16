@@ -28,7 +28,7 @@ pub struct Config {
     pub log_level: String,
 
     /// Path to the SQLite database file
-    #[arg(long, env = "DB_PATH", default_value = "config/cache.db")]
+    #[arg(long, env = "DB_PATH", default_value = "cache-123pan.db")]
     pub db_path: String,
 
     /// Force rebuild of the file list cache on startup

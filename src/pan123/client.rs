@@ -924,11 +924,6 @@ impl Pan123Client {
                         etag: Set(None),
                         updated_at: Set(chrono::Utc::now().naive_utc()),
                     })
-                    .on_conflict(
-                        sea_orm::sea_query::OnConflict::column(entity::Column::FileId)
-                            .do_nothing()
-                            .to_owned(),
-                    )
                     .exec(&self.db)
                     .await
                     .map_err(|e| {
@@ -957,8 +952,13 @@ impl Pan123Client {
             tracing::debug!("Crawling directory: {}", path);
             let files = self.fetch_files_from_api(parent_id).await?;
 
-            for f in files {
-                entity::Entity::insert(entity::ActiveModel {
+            if files.is_empty() {
+                continue;
+            }
+
+            let mut models = Vec::with_capacity(files.len());
+            for f in &files {
+                models.push(entity::ActiveModel {
                     file_id: Set(f.file_id),
                     parent_id: Set(parent_id),
                     name: Set(f.filename.clone()),
@@ -966,18 +966,24 @@ impl Pan123Client {
                     size: Set(f.size),
                     etag: Set(None),
                     updated_at: Set(chrono::Utc::now().naive_utc()),
-                })
-                .on_conflict(
-                    sea_orm::sea_query::OnConflict::column(entity::Column::FileId)
-                        .do_nothing()
-                        .to_owned(),
-                )
-                .exec(&self.db)
-                .await
-                .map_err(|e| {
-                    AppError::Internal(format!("Failed to insert file in warm_cache: {}", e))
-                })?;
+                });
+            }
 
+            // SQLite parameter limit is usually 999.
+            // Each row has 7 columns. 50 * 7 = 350, which is safe.
+            for chunk in models.chunks(50) {
+                entity::Entity::insert_many(chunk.to_vec())
+                    .exec(&self.db)
+                    .await
+                    .map_err(|e| {
+                        AppError::Internal(format!(
+                            "Failed to batch insert files in warm_cache: {}",
+                            e
+                        ))
+                    })?;
+            }
+
+            for f in files {
                 if f.is_folder() {
                     queue.push((f.file_id, format!("{}/{}", path, f.filename)));
                 }

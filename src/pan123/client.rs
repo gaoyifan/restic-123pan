@@ -113,6 +113,18 @@ impl Pan123Client {
             .await
             .map_err(|e| AppError::Internal(format!("Failed to connect to database: {}", e)))?;
 
+        // Enable SQLite performance optimizations
+        db.execute(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Sqlite,
+            "PRAGMA journal_mode=WAL;
+             PRAGMA synchronous=NORMAL;
+             PRAGMA cache_size=-64000; -- 64MB negative means pages
+             PRAGMA temp_store=MEMORY;
+             PRAGMA mmap_size=1000000000;",
+        ))
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to set SQLite pragmas: {}", e)))?;
+
         let client = Self {
             token_manager: TokenManager::new(client_id, client_secret, db.clone()),
             repo_path,

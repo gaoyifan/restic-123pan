@@ -118,9 +118,9 @@ impl Pan123Client {
             sea_orm::DatabaseBackend::Sqlite,
             "PRAGMA journal_mode=WAL;
              PRAGMA synchronous=NORMAL;
-             PRAGMA cache_size=-64000; -- 64MB negative means pages
+             PRAGMA cache_size=-256000; -- 256MB negative means pages
              PRAGMA temp_store=MEMORY;
-             PRAGMA mmap_size=1000000000;",
+             PRAGMA mmap_size=30000000000;",
         ))
         .await
         .map_err(|e| AppError::Internal(format!("Failed to set SQLite pragmas: {}", e)))?;

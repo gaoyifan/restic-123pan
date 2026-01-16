@@ -16,6 +16,77 @@ use sea_orm::{
     *,
 };
 
+/// Macro to handle API retries for 429 (Rate Limit) and 401 (Unauthorized)
+macro_rules! retry_api {
+    ($self:expr, $request_maker:expr) => {{
+        const MAX_RETRIES: usize = 3;
+        const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+        let mut final_response = None;
+
+        for attempt in 0..=MAX_RETRIES {
+            let token = $self.token_manager.get_token().await?;
+
+            // Execute the request
+            let response = $request_maker(&token).await?;
+
+            // Parse response body as text first to handle potential debug logging and flexible parsing
+            let text = response.text().await?;
+
+            // Try to parse as JSON
+            let api_response: ApiResponse<_> = match serde_json::from_str(&text) {
+                Ok(v) => v,
+                Err(e) => {
+                    return Err(AppError::Pan123Api {
+                        code: -1,
+                        message: format!("Failed to parse response JSON: {}", e)
+                    });
+                }
+            };
+
+            // Check for 429 rate limit error
+            if api_response.code == 429 {
+                if attempt < MAX_RETRIES {
+                    tracing::warn!(
+                        "Rate limited (429), waiting {}s before retry (attempt {}/{})",
+                        RETRY_DELAY.as_secs(),
+                        attempt + 1,
+                        MAX_RETRIES
+                    );
+                    tokio::time::sleep(RETRY_DELAY).await;
+                    continue;
+                } else {
+                    tracing::error!(
+                        "Rate limited (429) after {} retries, giving up",
+                        MAX_RETRIES
+                    );
+                    return Err(AppError::Pan123Api {
+                        code: api_response.code,
+                        message: api_response.message,
+                    });
+                }
+            }
+
+            // Check for 401 unauthorized error (token expired)
+            if api_response.code == 401 {
+                if attempt < MAX_RETRIES {
+                    tracing::warn!("Token expired (401), refreshing token and retrying (attempt {}/{})", attempt + 1, MAX_RETRIES);
+                    if let Err(e) = $self.token_manager.refresh_token().await {
+                        tracing::error!("Failed to refresh token on 401: {}", e);
+                    }
+                    continue;
+                }
+                // If max retries reached, fall through to return the 401 response
+                // This prevents the panic by NOT continuing the loop, but returning the validation error
+            }
+
+            final_response = Some(api_response);
+            break;
+        }
+
+        final_response.expect("Retry loop should always return a result")
+    }};
+}
+
 /// Client for interacting with 123pan API.
 #[derive(Clone)]
 pub struct Pan123Client {
@@ -90,50 +161,14 @@ impl Pan123Client {
     /// Make an authenticated GET request with 429 retry support.
     /// Retries up to 3 times with 1 second delay on 429 rate limit errors.
     async fn get<T: serde::de::DeserializeOwned>(&self, url: &str) -> Result<ApiResponse<T>> {
-        const MAX_RETRIES: usize = 3;
-        const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
-
-        for attempt in 0..=MAX_RETRIES {
-            let token = self.token_manager.get_token().await?;
-
-            let response = self
-                .token_manager
+        Ok(retry_api!(self, |token| {
+            self.token_manager
                 .http_client()
                 .get(url)
                 .header("Authorization", format!("Bearer {}", token))
                 .header("Platform", "open_platform")
                 .send()
-                .await?;
-
-            let api_response: ApiResponse<T> = response.json().await?;
-
-            // Check for 429 rate limit error
-            if api_response.code == 429 {
-                if attempt < MAX_RETRIES {
-                    tracing::warn!(
-                        "Rate limited (429), waiting {}s before retry (attempt {}/{})",
-                        RETRY_DELAY.as_secs(),
-                        attempt + 1,
-                        MAX_RETRIES
-                    );
-                    tokio::time::sleep(RETRY_DELAY).await;
-                    continue;
-                } else {
-                    tracing::error!(
-                        "Rate limited (429) after {} retries, giving up",
-                        MAX_RETRIES
-                    );
-                    return Err(AppError::Pan123Api {
-                        code: api_response.code,
-                        message: api_response.message,
-                    });
-                }
-            }
-
-            return Ok(api_response);
-        }
-
-        unreachable!()
+        }))
     }
 
     /// Make an authenticated GET request without timeout.
@@ -143,51 +178,15 @@ impl Pan123Client {
         &self,
         url: &str,
     ) -> Result<ApiResponse<T>> {
-        const MAX_RETRIES: usize = 3;
-        const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
-
-        for attempt in 0..=MAX_RETRIES {
-            let token = self.token_manager.get_token().await?;
-
-            let response = self
-                .token_manager
+        Ok(retry_api!(self, |token| {
+            self.token_manager
                 .http_client()
                 .get(url)
                 .timeout(std::time::Duration::MAX) // No timeout
                 .header("Authorization", format!("Bearer {}", token))
                 .header("Platform", "open_platform")
                 .send()
-                .await?;
-
-            let api_response: ApiResponse<T> = response.json().await?;
-
-            // Check for 429 rate limit error
-            if api_response.code == 429 {
-                if attempt < MAX_RETRIES {
-                    tracing::warn!(
-                        "Rate limited (429), waiting {}s before retry (attempt {}/{})",
-                        RETRY_DELAY.as_secs(),
-                        attempt + 1,
-                        MAX_RETRIES
-                    );
-                    tokio::time::sleep(RETRY_DELAY).await;
-                    continue;
-                } else {
-                    tracing::error!(
-                        "Rate limited (429) after {} retries, giving up",
-                        MAX_RETRIES
-                    );
-                    return Err(AppError::Pan123Api {
-                        code: api_response.code,
-                        message: api_response.message,
-                    });
-                }
-            }
-
-            return Ok(api_response);
-        }
-
-        unreachable!()
+        }))
     }
 
     /// Make an authenticated POST request with JSON body and 429 retry support.
@@ -197,17 +196,11 @@ impl Pan123Client {
         url: &str,
         body: &B,
     ) -> Result<ApiResponse<T>> {
-        const MAX_RETRIES: usize = 3;
-        const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
-
         // Serialize body once for reuse in retries
         let body_json = serde_json::to_string(body)?;
 
-        for attempt in 0..=MAX_RETRIES {
-            let token = self.token_manager.get_token().await?;
-
-            let response = self
-                .token_manager
+        Ok(retry_api!(self, |token| {
+            self.token_manager
                 .http_client()
                 .post(url)
                 .header("Authorization", format!("Bearer {}", token))
@@ -215,37 +208,7 @@ impl Pan123Client {
                 .header("Content-Type", "application/json")
                 .body(body_json.clone())
                 .send()
-                .await?;
-
-            let api_response: ApiResponse<T> = response.json().await?;
-
-            // Check for 429 rate limit error
-            if api_response.code == 429 {
-                if attempt < MAX_RETRIES {
-                    tracing::warn!(
-                        "Rate limited (429), waiting {}s before retry (attempt {}/{})",
-                        RETRY_DELAY.as_secs(),
-                        attempt + 1,
-                        MAX_RETRIES
-                    );
-                    tokio::time::sleep(RETRY_DELAY).await;
-                    continue;
-                } else {
-                    tracing::error!(
-                        "Rate limited (429) after {} retries, giving up",
-                        MAX_RETRIES
-                    );
-                    return Err(AppError::Pan123Api {
-                        code: api_response.code,
-                        message: api_response.message,
-                    });
-                }
-            }
-
-            return Ok(api_response);
-        }
-
-        unreachable!()
+        }))
     }
 
     // ========================================================================
@@ -264,75 +227,42 @@ impl Pan123Client {
         }
 
         // Fetch from API with 429 retry support
-        const MAX_RETRIES: usize = 3;
-        const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
         let url = format!("{}/upload/v2/file/domain", BASE_URL);
 
-        for attempt in 0..=MAX_RETRIES {
-            let token = self.token_manager.get_token().await?;
-
-            let response = self
-                .token_manager
+        let api_response: ApiResponse<Vec<String>> = retry_api!(self, |token| {
+            self.token_manager
                 .http_client()
                 .get(&url)
                 .header("Authorization", format!("Bearer {}", token))
                 .header("Platform", "open_platform")
                 .send()
-                .await?;
+        });
 
-            let api_response: ApiResponse<Vec<String>> = response.json().await?;
-
-            // Check for 429 rate limit error
-            if api_response.code == 429 {
-                if attempt < MAX_RETRIES {
-                    tracing::warn!(
-                        "Rate limited (429) when fetching upload domain, waiting {}s before retry (attempt {}/{})",
-                        RETRY_DELAY.as_secs(),
-                        attempt + 1,
-                        MAX_RETRIES
-                    );
-                    tokio::time::sleep(RETRY_DELAY).await;
-                    continue;
-                } else {
-                    tracing::error!(
-                        "Rate limited (429) after {} retries when fetching upload domain, giving up",
-                        MAX_RETRIES
-                    );
-                    return Err(AppError::Pan123Api {
-                        code: api_response.code,
-                        message: api_response.message,
-                    });
-                }
-            }
-
-            if !api_response.is_success() {
-                return Err(AppError::Pan123Api {
-                    code: api_response.code,
-                    message: api_response.message,
-                });
-            }
-
-            let domains = api_response
-                .data
-                .ok_or_else(|| AppError::Internal("No upload domain in response".to_string()))?;
-
-            let domain = domains
-                .into_iter()
-                .next()
-                .ok_or_else(|| AppError::Internal("Empty upload domain list".to_string()))?;
-
-            tracing::info!("Fetched upload domain: {}", domain);
-
-            // Cache the domain
-            {
-                let mut cache = self.upload_domain.write();
-                *cache = Some(domain.clone());
-            }
-
-            return Ok(domain);
+        if !api_response.is_success() {
+            return Err(AppError::Pan123Api {
+                code: api_response.code,
+                message: api_response.message,
+            });
         }
 
-        unreachable!()
+        let domains = api_response
+            .data
+            .ok_or_else(|| AppError::Internal("No upload domain in response".to_string()))?;
+
+        let domain = domains
+            .into_iter()
+            .next()
+            .ok_or_else(|| AppError::Internal("Empty upload domain list".to_string()))?;
+
+        tracing::info!("Fetched upload domain: {}", domain);
+
+        // Cache the domain
+        {
+            let mut cache = self.upload_domain.write();
+            *cache = Some(domain.clone());
+        }
+
+        Ok(domain)
     }
 
     // ========================================================================
@@ -681,16 +611,12 @@ impl Pan123Client {
         let md5_hash = format!("{:x}", md5::compute(&data));
 
         let upload_domain = self.get_upload_domain().await?;
-        const MAX_RETRIES: usize = 3;
-        const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
         let upload_url = format!("{}/upload/v2/file/single/create", upload_domain);
 
         // Store data as Vec<u8> for reuse in retries
         let data_vec = data.to_vec();
 
-        for attempt in 0..=MAX_RETRIES {
-            let token = self.token_manager.get_token().await?;
-
+        let api_response: ApiResponse<SingleUploadData> = retry_api!(self, |token| {
             // Create multipart form with duplicate=2 for atomic overwrite
             let form = Form::new()
                 .text("parentFileID", parent_id.to_string())
@@ -703,99 +629,63 @@ impl Pan123Client {
                     Part::bytes(data_vec.clone()).file_name(filename.to_string()),
                 );
 
-            let response = self
-                .token_manager
+            self.token_manager
                 .http_client()
                 .post(&upload_url)
                 .header("Authorization", format!("Bearer {}", token))
                 .header("Platform", "open_platform")
                 .multipart(form)
                 .send()
-                .await?;
+        });
 
-            let status = response.status();
-            let text = response.text().await?;
-
-            tracing::debug!("Upload response status: {}, body: {}", status, text);
-
-            let api_response: ApiResponse<SingleUploadData> = serde_json::from_str(&text)?;
-
-            // Check for 429 rate limit error
-            if api_response.code == 429 {
-                if attempt < MAX_RETRIES {
-                    tracing::warn!(
-                        "Rate limited (429) when uploading file '{}', waiting {}s before retry (attempt {}/{})",
-                        filename,
-                        RETRY_DELAY.as_secs(),
-                        attempt + 1,
-                        MAX_RETRIES
-                    );
-                    tokio::time::sleep(RETRY_DELAY).await;
-                    continue;
-                } else {
-                    tracing::error!(
-                        "Rate limited (429) after {} retries when uploading file '{}', giving up",
-                        MAX_RETRIES,
-                        filename
-                    );
-                    return Err(AppError::Pan123Api {
-                        code: api_response.code,
-                        message: api_response.message,
-                    });
-                }
-            }
-
-            if !api_response.is_success() {
-                return Err(AppError::Pan123Api {
-                    code: api_response.code,
-                    message: api_response.message,
-                });
-            }
-
-            let upload_data = api_response
-                .data
-                .ok_or_else(|| AppError::Internal("No data in upload response".to_string()))?;
-
-            if !upload_data.completed {
-                return Err(AppError::Internal("Upload not completed".to_string()));
-            }
-
-            let file_id = upload_data.file_id;
-
-            // Sync with DB (insert or replace by parent/name)
-            entity::Entity::insert(entity::ActiveModel {
-                file_id: Set(file_id),
-                parent_id: Set(parent_id),
-                name: Set(filename.to_string()),
-                is_dir: Set(false),
-                size: Set(file_size),
-                etag: Set(Some(md5_hash.clone())),
-                updated_at: Set(chrono::Utc::now().naive_utc()),
-            })
-            .on_conflict(
-                sea_orm::sea_query::OnConflict::columns([
-                    entity::Column::ParentId,
-                    entity::Column::Name,
-                ])
-                .update_columns([
-                    entity::Column::FileId,
-                    entity::Column::ParentId,
-                    entity::Column::Name,
-                    entity::Column::Size,
-                    entity::Column::Etag,
-                    entity::Column::UpdatedAt,
-                ])
-                .to_owned(),
-            )
-            .exec(&self.db)
-            .await
-            .map_err(|e| AppError::Internal(format!("Failed to sync file to DB: {}", e)))?;
-
-            tracing::info!("Uploaded file '{}' with id {}", filename, file_id);
-            return Ok(file_id);
+        if !api_response.is_success() {
+            return Err(AppError::Pan123Api {
+                code: api_response.code,
+                message: api_response.message,
+            });
         }
 
-        unreachable!()
+        let upload_data = api_response
+            .data
+            .ok_or_else(|| AppError::Internal("No data in upload response".to_string()))?;
+
+        if !upload_data.completed {
+            return Err(AppError::Internal("Upload not completed".to_string()));
+        }
+
+        let file_id = upload_data.file_id;
+
+        // Sync with DB (insert or replace by parent/name)
+        entity::Entity::insert(entity::ActiveModel {
+            file_id: Set(file_id),
+            parent_id: Set(parent_id),
+            name: Set(filename.to_string()),
+            is_dir: Set(false),
+            size: Set(file_size),
+            etag: Set(Some(md5_hash.clone())),
+            updated_at: Set(chrono::Utc::now().naive_utc()),
+        })
+        .on_conflict(
+            sea_orm::sea_query::OnConflict::columns([
+                entity::Column::ParentId,
+                entity::Column::Name,
+            ])
+            .update_columns([
+                entity::Column::FileId,
+                entity::Column::ParentId,
+                entity::Column::Name,
+                entity::Column::Size,
+                entity::Column::Etag,
+                entity::Column::UpdatedAt,
+            ])
+            .to_owned(),
+        )
+        .exec(&self.db)
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to sync file to DB: {}", e)))?;
+
+        tracing::info!("Uploaded file '{}' with id {}", filename, file_id);
+        return Ok(file_id);
     }
 
     /// Get download URL for a file.

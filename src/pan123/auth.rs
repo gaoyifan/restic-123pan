@@ -37,6 +37,7 @@ pub struct TokenManager {
     http_client: Client,
     db: DatabaseConnection,
     token: Arc<RwLock<Option<TokenInfo>>>,
+    last_refresh_time: Arc<RwLock<Option<DateTime<Utc>>>>,
 }
 
 const TOKEN_CACHE_TABLE: &str = "token_cache";
@@ -58,6 +59,7 @@ impl TokenManager {
             http_client,
             db,
             token: Arc::new(RwLock::new(None)),
+            last_refresh_time: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -73,11 +75,7 @@ impl TokenManager {
                     .not_null()
                     .primary_key(),
             )
-            .col(
-                ColumnDef::new(TOKEN_CACHE_ACCESS_TOKEN)
-                    .string()
-                    .not_null(),
-            )
+            .col(ColumnDef::new(TOKEN_CACHE_ACCESS_TOKEN).string().not_null())
             .col(ColumnDef::new(TOKEN_CACHE_EXPIRES_AT).string().not_null())
             .to_owned();
 
@@ -113,7 +111,34 @@ impl TokenManager {
 
     /// Force refresh the access token.
     /// Includes 429 retry support.
-    async fn refresh_token(&self) -> Result<String> {
+    /// Rate limited to once per minute.
+    pub async fn refresh_token(&self) -> Result<String> {
+        // Rate limit check
+        {
+            let last_refresh = self.last_refresh_time.read();
+            if let Some(last_time) = *last_refresh {
+                let now = Utc::now();
+                if now - last_time < Duration::minutes(1) {
+                    tracing::warn!(
+                        "Token refresh rate limited (last refresh: {}), returning cached token if available",
+                        last_time
+                    );
+                    // Try to return existing token even if potentially expired,
+                    // or just return what we have to avoid spamming API.
+                    // Ideally we should check if we really have a token.
+                    let token_guard = self.token.read();
+                    if let Some(ref token_info) = *token_guard {
+                        return Ok(token_info.access_token.clone());
+                    }
+                    // If we don't have a token and we are rate limited, we might just have to error
+                    // or wait. For now, returning error to signal we can't refresh yet is safer
+                    // than spamming, but might cause downstream failures.
+                    // Let's decide to return early.
+                    return Err(AppError::Auth("Token refresh rate limited".to_string()));
+                }
+            }
+        }
+
         tracing::info!("Refreshing 123pan access token");
 
         const MAX_RETRIES: usize = 3;
@@ -203,6 +228,12 @@ impl TokenManager {
                 expires_at
             );
 
+            // Update last refresh time
+            {
+                let mut last_refresh = self.last_refresh_time.write();
+                *last_refresh = Some(Utc::now());
+            }
+
             return Ok(data.access_token);
         }
 
@@ -280,9 +311,10 @@ impl TokenManager {
             )
             .to_owned();
 
-        self.db.execute(builder.build(&stmt)).await.map_err(|e| {
-            AppError::Internal(format!("Failed to upsert token cache: {}", e))
-        })?;
+        self.db
+            .execute(builder.build(&stmt))
+            .await
+            .map_err(|e| AppError::Internal(format!("Failed to upsert token cache: {}", e)))?;
 
         Ok(())
     }

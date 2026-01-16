@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.7
 # Multi-stage build for optimized Rust binary
 FROM rust:1.92-slim AS builder
 
@@ -20,13 +21,20 @@ COPY Cargo.toml Cargo.lock ./
 RUN mkdir src && echo "fn main() {}" > src/main.rs
 
 # Build dependencies only (this layer will be cached unless Cargo.toml changes)
-RUN cargo build --release && rm -rf src
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/app/target \
+    cargo build --release && rm -rf src
 
 # Copy source code
 COPY src ./src
 
 # Build the actual application
-RUN touch src/main.rs && cargo build --release
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/app/target \
+    touch src/main.rs && cargo build --release \
+    && cp /app/target/release/restic-123pan /app/restic-123pan
 
 # Runtime stage - Debian 13 (Trixie)
 FROM debian:trixie-slim
@@ -43,7 +51,7 @@ RUN useradd -m -u 1000 appuser
 WORKDIR /app
 
 # Copy the binary from builder stage
-COPY --from=builder /app/target/release/restic-123pan /app/restic-123pan
+COPY --from=builder /app/restic-123pan /app/restic-123pan
 
 # Change ownership to non-root user
 RUN chown -R appuser:appuser /app

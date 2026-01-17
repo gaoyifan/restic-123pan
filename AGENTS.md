@@ -1,192 +1,147 @@
 # AGENTS.md
 
-This file provides guidance for AI agents working with the restic-123pan codebase.
+Guidance for AI agents working with the restic-123pan codebase.
 
 ## Project Overview
 
-This is a Rust-based REST API server that implements the Restic backup tool's REST backend protocol (v2 only), using 123pan cloud storage as the storage provider. It acts as a bridge between Restic clients and the 123pan Open Platform API.
-
-## Architecture
+Rust REST API server implementing Restic backup tool's REST backend protocol (v2 only), using 123pan cloud storage as the storage provider.
 
 ```
 restic CLI  <--REST API-->  This Server  <--HTTPS-->  123pan Open Platform
 ```
 
-The server receives standard Restic REST API v2 requests and translates them into 123pan API calls.
+## Build, Test Commands
+
+```bash
+# Build
+just build                           # Development build
+
+# Run all tests (single-threaded to avoid rate limiting)
+just test
+
+# Run all tests with output
+just test-verbose
+
+# Run unit tests only (no integration/e2e)
+just test-unit
+
+# Run integration tests
+just test-integration
+
+# Run cache consistency tests
+just test-cache
+
+# Run basic e2e backup/restore test
+just test-e2e
+
+# Run 100MB large scale test (takes several minutes)
+just test-e2e-100mb
+
+# Run a quick sanity check (build + unit tests)
+just check
+```
 
 ## Project Structure
 
 ```
 src/
 ├── main.rs           # Entry point, CLI parsing, Axum server setup
+├── lib.rs            # Library exports
 ├── config.rs         # Configuration via clap (CLI args + env vars)
 ├── error.rs          # Error types with HTTP response mapping
 ├── pan123/           # 123pan API client module
-│   ├── mod.rs        # Module exports
 │   ├── auth.rs       # Token management with auto-refresh
 │   ├── client.rs     # HTTP client for all 123pan operations
+│   ├── entity.rs     # SeaORM entity for SQLite cache
 │   └── types.rs      # Request/response types for 123pan API
 └── restic/           # Restic REST API handlers
-    ├── mod.rs        # Module exports
-    ├── handler.rs    # Axum route handlers for all endpoints
+    ├── handler.rs    # Axum route handlers
     └── types.rs      # Restic API types (v2 only)
 
 tests/
 ├── integration_test.rs  # Tests 123pan API directly
 └── e2e_test.rs          # Full backup/restore with restic CLI
-
-docs/
-└── technical.md      # Detailed implementation documentation (Chinese)
 ```
 
-## Key Components
+## Code Style Guidelines
 
-### `pan123/auth.rs` - Token Manager
-- Manages OAuth access tokens from 123pan
-- Auto-refreshes tokens before expiry (5-minute buffer)
-- Thread-safe with `parking_lot::RwLock`
+### Imports
 
-### `pan123/client.rs` - 123pan Client
-- Core API operations: list, upload, download, delete
-- Directory ID caching for performance
-- Dynamic upload domain fetching at startup
-- Uses `duplicate=2` for atomic file overwrites
-- Native Range download support
+Order: std → external crates → crate-local modules. Use nested imports:
 
-### `restic/handler.rs` - REST Handlers
-- Implements Restic REST API v2 endpoints only
-- Maps Restic file types to 123pan directory paths
-- Idempotent delete operations (returns 200 even if file doesn't exist)
-
-## Building
-
-```bash
-# Development build
-cargo build
-
-# Release build
-cargo build --release
-
-# Run with required env vars
-PAN123_CLIENT_ID=xxx PAN123_CLIENT_SECRET=xxx cargo run
+```rust
+use axum::{body::Body, extract::State, http::StatusCode};
+use std::sync::Arc;
+use crate::error::{AppError, Result};
 ```
 
-## Testing
+### Error Handling
 
-```bash
-# Run all tests with single thread (avoids rate limiting)
-PAN123_CLIENT_ID=xxx PAN123_CLIENT_SECRET=xxx cargo test -- --test-threads=1
+- Use `AppError` enum in `error.rs` for all errors
+- Define `pub type Result<T> = std::result::Result<T, AppError>;`
+- Use `?` operator for propagation; use `thiserror` for error derives
+- Map errors to HTTP status codes in `IntoResponse` impl
 
-# E2E tests only
-cargo test --test e2e_test
+### Logging
 
-# Integration tests only
-cargo test --test integration_test
-```
+Use `tracing` macros: `tracing::info!`, `tracing::debug!`, `tracing::warn!`, `tracing::error!`
 
-## Dependencies
+### Types & Serialization
 
-Key crates used:
-- **axum** - Web framework for REST API
-- **reqwest** - HTTP client for 123pan API calls
-- **tokio** - Async runtime
-- **serde/serde_json** - JSON serialization
-- **clap** - CLI argument parsing with env var support
-- **tracing** - Structured logging
-- **parking_lot** - Fast synchronization primitives
-- **md5** - Hash calculation for uploads
+- Use `#[serde(rename_all = "camelCase")]` for 123pan API types
+- Use explicit `#[serde(rename = "...")]` for non-standard field names
+- Use `i64` for file IDs and sizes (123pan API uses large integers)
 
-## 123pan API Endpoints Used
+### Testing
 
-| 123pan API | Purpose |
-|------------|---------|
-| `POST /api/v1/access_token` | Get OAuth token |
-| `GET /upload/v2/file/domain` | Get upload domain (cached) |
-| `POST /upload/v1/file/mkdir` | Create directory |
-| `GET /api/v2/file/list` | List directory contents |
-| `GET /api/v1/file/download_info` | Get download URL |
-| `POST {upload_domain}/upload/v2/file/single/create` | Upload files (with duplicate=2) |
-| `POST /api/v1/file/trash` | Move to trash |
-| `POST /api/v1/file/delete` | Permanently delete |
+- Use `skip_if_no_credentials!()` macro for tests requiring 123pan API
+- Use `--test-threads=1` to avoid rate limiting
+- Use `tempfile` for temporary directories; clean up resources in teardown
 
-## Restic REST API v2 Endpoints
+### Git
 
-| Method | Path | Description |
-|--------|------|-------------|
-| POST | `/?create=true` | Initialize repository |
-| DELETE | `/` | Delete repository (not implemented) |
-| HEAD/GET/POST | `/config` | Config file operations |
-| GET | `/:type/` | List files by type (v2 format) |
-| HEAD/GET/POST/DELETE | `/:type/:name` | Individual file operations |
+- Conventional commit message: `type: description` (lowercase, no period). Types: `feat`, `fix`, `docs`, `refactor`, `test`, `chore`
+- Never commit (`git commit`) without the user's explicit approval of changes
 
-File types: `data`, `keys`, `locks`, `snapshots`, `index`
+## Key Design Patterns
 
-## Coding Conventions
+### Retry with Backoff
 
-1. **Error Handling**: Use `AppError` enum, convert to appropriate HTTP status codes
-2. **Async**: All I/O operations are async using tokio
-3. **Logging**: Use `tracing` macros (`tracing::info!`, `tracing::debug!`, etc.)
-4. **Path Parameters**: Axum uses `:param` syntax (e.g., `/:type/:name`)
-5. **JSON**: Use serde with `#[serde(rename_all = "camelCase")]` for 123pan API types
+Use `retry_api!` macro for 429 (rate limit) and 401 (token expired) handling.
+
+### Idempotent Operations
+
+- DELETE returns 200 even if file doesn't exist
+- Upload with `duplicate=2` for atomic overwrites
+
+### Caching
+
+- SQLite-backed persistent cache for file listings
+- Cache updated synchronously on upload/delete operations
+- Use `warm_cache()` at startup to pre-populate
+
+## Environment Variables
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `PAN123_CLIENT_ID` | Yes | - | 123pan client ID |
+| `PAN123_CLIENT_SECRET` | Yes | - | 123pan client secret |
+| `PAN123_REPO_PATH` | No | `/restic-backup` | Root path on 123pan |
+| `LISTEN_ADDR` | No | `127.0.0.1:8000` | Server bind address |
+| `RUST_LOG` | No | `info` | Log level |
+| `DB_PATH` | No | `cache-123pan.db` | SQLite cache file |
+| `FORCE_CACHE_REBUILD` | No | `false` | Rebuild cache on startup |
 
 ## Common Tasks
 
 ### Adding a new 123pan API call
+
 1. Add request/response types to `pan123/types.rs`
-2. Implement the method in `pan123/client.rs`
-3. Use `self.get()` or `self.post()` helper methods for authenticated requests
+2. Implement method in `pan123/client.rs` using `self.get()` or `self.post()`
+3. Add tests to `tests/integration_test.rs`
 
 ### Adding a new Restic endpoint
-1. Add the handler function in `restic/handler.rs`
-2. Register the route in `create_router()`
-3. Update tests as needed
 
-### Debugging API issues
-- Set `RUST_LOG=debug` to see detailed request/response logs
-- Check 123pan API response codes in error messages
-- Verify token is valid (auto-refresh should handle this)
-
-## Known Limitations
-
-1. Single-step upload limited to 1GB files (123pan API limitation)
-2. Delete repository not implemented
-3. No multipart upload support for large files
-
-## Design Decisions
-
-### Directory Listing vs Search API
-123pan's `searchMode=1` has index delays for newly created files, making it unreliable for Restic's workflow. We use full directory listing (`list_files`) instead.
-
-### Idempotent Delete
-Delete operations return HTTP 200 even if the file doesn't exist, as Restic may attempt to delete non-existent lock files.
-
-### Atomic Overwrites
-Using `duplicate=2` in uploads allows atomic file replacement without needing to delete first.
-
-## Environment Variables
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `PAN123_CLIENT_ID` | 123pan client ID | (required) |
-| `PAN123_CLIENT_SECRET` | 123pan client secret | (required) |
-| `PAN123_REPO_PATH` | Root path on 123pan | `/restic-backup` |
-| `LISTEN_ADDR` | Server bind address | `127.0.0.1:8000` |
-| `RUST_LOG` | Log level | `info` |
-
-## Useful Commands
-
-```bash
-# Check for lint issues
-cargo clippy
-
-# Format code
-cargo fmt
-
-# Run with debug logging
-RUST_LOG=debug cargo run
-
-# Test with actual restic
-restic -r rest:http://127.0.0.1:8000/ init
-restic -r rest:http://127.0.0.1:8000/ backup /path/to/files
-restic -r rest:http://127.0.0.1:8000/ snapshots
-```
+1. Add handler in `restic/handler.rs`
+2. Register route in `create_router()`
+3. Add tests as needed

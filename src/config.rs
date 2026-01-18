@@ -35,11 +35,3 @@ pub struct Config {
     #[arg(long, env = "FORCE_CACHE_REBUILD", default_value = "false")]
     pub force_cache_rebuild: bool,
 }
-
-impl Config {
-    /// Parse configuration from command line arguments and environment variables.
-    #[allow(dead_code)]
-    pub fn parse_config() -> Self {
-        Config::parse()
-    }
-}

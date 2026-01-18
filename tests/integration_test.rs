@@ -46,8 +46,10 @@ async fn get_access_token(client_id: &str, client_secret: &str) -> Result<String
             .await
             .map_err(|e| format!("Failed to send request: {}", e))?;
 
-        let body: serde_json::Value =
-            response.json().await.map_err(|e| format!("Failed to parse response: {}", e))?;
+        let body: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse response: {}", e))?;
 
         if body["code"] == 429 {
             if std::time::Instant::now() >= deadline {
@@ -79,9 +81,13 @@ where
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
 
     loop {
-        let response = f().await.map_err(|e| format!("Failed to send request: {}", e))?;
-        let body: serde_json::Value =
-            response.json().await.map_err(|e| format!("Failed to parse response: {}", e))?;
+        let response = f()
+            .await
+            .map_err(|e| format!("Failed to send request: {}", e))?;
+        let body: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse response: {}", e))?;
 
         if body["code"] == 429 {
             if std::time::Instant::now() >= deadline {

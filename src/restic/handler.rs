@@ -11,9 +11,9 @@ use axum::{
 use serde::Deserialize;
 use std::sync::Arc;
 
-use super::types::FileEntryV2;
+use super::types::{FileEntryV2, ResticFileType};
 use crate::error::{AppError, Result};
-use crate::pan123::{Pan123Client, ResticFileType};
+use crate::pan123::Pan123Client;
 
 /// Application state shared across handlers.
 #[derive(Clone)]
@@ -175,13 +175,7 @@ async fn list_files(
     };
 
     // Always return v2 format (name + size)
-    let entries: Vec<FileEntryV2> = files
-        .iter()
-        .map(|f| FileEntryV2 {
-            name: f.filename.clone(),
-            size: f.size as u64,
-        })
-        .collect();
+    let entries: Vec<FileEntryV2> = files.iter().map(FileEntryV2::from).collect();
 
     let body = serde_json::to_string(&entries)?;
 

@@ -68,6 +68,19 @@ impl FileInfo {
     }
 }
 
+impl From<crate::pan123::entity::Model> for FileInfo {
+    fn from(model: crate::pan123::entity::Model) -> Self {
+        Self {
+            file_id: model.file_id,
+            filename: model.name,
+            file_type: if model.is_dir { 1 } else { 0 },
+            size: model.size,
+            parent_file_id: model.parent_id,
+            trashed: 0,
+        }
+    }
+}
+
 /// Response data for file list.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -133,51 +146,4 @@ pub struct SingleUploadData {
     #[serde(rename = "fileID")]
     pub file_id: i64,
     pub completed: bool,
-}
-
-// ============================================================================
-// File Type Mapping
-// ============================================================================
-
-/// Restic file types mapped to directory names.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ResticFileType {
-    Config,
-    Data,
-    Keys,
-    Locks,
-    Snapshots,
-    Index,
-}
-
-impl ResticFileType {
-    /// Get the directory name for this file type.
-    pub fn dirname(&self) -> &'static str {
-        match self {
-            ResticFileType::Config => "config",
-            ResticFileType::Data => "data",
-            ResticFileType::Keys => "keys",
-            ResticFileType::Locks => "locks",
-            ResticFileType::Snapshots => "snapshots",
-            ResticFileType::Index => "index",
-        }
-    }
-
-    /// Parse file type from string.
-    pub fn from_str(s: &str) -> Option<Self> {
-        match s {
-            "config" => Some(ResticFileType::Config),
-            "data" => Some(ResticFileType::Data),
-            "keys" => Some(ResticFileType::Keys),
-            "locks" => Some(ResticFileType::Locks),
-            "snapshots" => Some(ResticFileType::Snapshots),
-            "index" => Some(ResticFileType::Index),
-            _ => None,
-        }
-    }
-
-    /// Check if this type is config (special handling - single file, not directory).
-    pub fn is_config(&self) -> bool {
-        matches!(self, ResticFileType::Config)
-    }
 }

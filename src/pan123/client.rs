@@ -7,90 +7,20 @@ use std::sync::Arc;
 
 use super::auth::{TokenManager, BASE_URL};
 use super::entity;
-use super::types::*;
+use super::types::{
+    ApiResponse, CreateDirData, CreateDirRequest, DeleteRequest, DownloadInfoData, FileInfo,
+    FileListData, MoveRequest, SingleUploadData, TrashRequest,
+};
+use super::{MAX_RETRIES, RETRY_DELAY};
 use crate::error::{AppError, Result};
+use crate::restic::ResticFileType;
+
 use sea_orm::{
     entity::*,
     query::*,
     sea_query::{Expr, Index},
     *,
 };
-
-/// Macro to handle API retries for 429 (Rate Limit) and 401 (Unauthorized)
-macro_rules! retry_api {
-    ($self:expr, $request_maker:expr) => {{
-        const MAX_RETRIES: usize = 3;
-        const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
-        let mut final_response = None;
-
-        for attempt in 0..=MAX_RETRIES {
-            let token = $self.token_manager.get_token().await?;
-
-            // Execute the request
-            let response = $request_maker(&token).await?;
-
-            // Parse response body as text first to handle potential debug logging and flexible parsing
-            let text = response.text().await?;
-
-            // Try to parse as JSON
-            let api_response: ApiResponse<_> = match serde_json::from_str(&text) {
-                Ok(v) => v,
-                Err(e) => {
-                    return Err(AppError::Pan123Api {
-                        code: -1,
-                        message: format!("Failed to parse response JSON: {}", e)
-                    });
-                }
-            };
-
-            // Log full response if it's an error
-            if !api_response.is_success() {
-                tracing::warn!("123pan API error response: {}", text);
-            }
-
-            // Check for 429 rate limit error
-            if api_response.code == 429 {
-                if attempt < MAX_RETRIES {
-                    tracing::warn!(
-                        "Rate limited (429), waiting {}s before retry (attempt {}/{})",
-                        RETRY_DELAY.as_secs(),
-                        attempt + 1,
-                        MAX_RETRIES
-                    );
-                    tokio::time::sleep(RETRY_DELAY).await;
-                    continue;
-                } else {
-                    tracing::error!(
-                        "Rate limited (429) after {} retries, giving up",
-                        MAX_RETRIES
-                    );
-                    return Err(AppError::Pan123Api {
-                        code: api_response.code,
-                        message: api_response.message,
-                    });
-                }
-            }
-
-            // Check for 401 unauthorized error (token expired)
-            if api_response.code == 401 {
-                if attempt < MAX_RETRIES {
-                    tracing::warn!("Token expired (401), refreshing token and retrying (attempt {}/{})", attempt + 1, MAX_RETRIES);
-                    if let Err(e) = $self.token_manager.refresh_token().await {
-                        tracing::error!("Failed to refresh token on 401: {}", e);
-                    }
-                    continue;
-                }
-                // If max retries reached, fall through to return the 401 response
-                // This prevents the panic by NOT continuing the loop, but returning the validation error
-            }
-
-            final_response = Some(api_response);
-            break;
-        }
-
-        final_response.expect("Retry loop should always return a result")
-    }};
-}
 
 /// Client for interacting with 123pan API.
 #[derive(Clone)]
@@ -104,6 +34,74 @@ pub struct Pan123Client {
 }
 
 impl Pan123Client {
+    async fn retry_api<T, F, Fut>(&self, request_maker: F) -> Result<ApiResponse<T>>
+    where
+        T: serde::de::DeserializeOwned,
+        F: Fn(&str) -> Fut,
+        Fut: std::future::Future<Output = std::result::Result<reqwest::Response, reqwest::Error>>,
+    {
+        for attempt in 0..=MAX_RETRIES {
+            let token = self.token_manager.get_token().await?;
+            let response = request_maker(&token).await?;
+            let text = response.text().await?;
+
+            let api_response: ApiResponse<T> = match serde_json::from_str(&text) {
+                Ok(v) => v,
+                Err(e) => {
+                    return Err(AppError::Pan123Api {
+                        code: -1,
+                        message: format!("Failed to parse response JSON: {}", e),
+                    });
+                }
+            };
+
+            if !api_response.is_success() {
+                tracing::warn!("123pan API error response: {}", text);
+            }
+
+            if api_response.code == 429 {
+                if attempt < MAX_RETRIES {
+                    tracing::warn!(
+                        "Rate limited (429), waiting {}s before retry (attempt {}/{})",
+                        RETRY_DELAY.as_secs(),
+                        attempt + 1,
+                        MAX_RETRIES
+                    );
+                    tokio::time::sleep(RETRY_DELAY).await;
+                    continue;
+                }
+                tracing::error!(
+                    "Rate limited (429) after {} retries, giving up",
+                    MAX_RETRIES
+                );
+                return Err(AppError::Pan123Api {
+                    code: api_response.code,
+                    message: api_response.message,
+                });
+            }
+
+            if api_response.code == 401 {
+                if attempt < MAX_RETRIES {
+                    tracing::warn!(
+                        "Token expired (401), refreshing token and retrying (attempt {}/{})",
+                        attempt + 1,
+                        MAX_RETRIES
+                    );
+                    if let Err(e) = self.token_manager.refresh_token().await {
+                        tracing::error!("Failed to refresh token on 401: {}", e);
+                    }
+                    continue;
+                }
+            }
+
+            return Ok(api_response);
+        }
+
+        Err(AppError::Internal(
+            "Retry loop returned no response".to_string(),
+        ))
+    }
+
     /// Create a new 123pan client.
     pub async fn new(
         client_id: String,
@@ -175,48 +173,48 @@ impl Pan123Client {
         Ok(())
     }
 
-    /// Make an authenticated GET request with 429 retry support.
-    /// Retries up to 3 times with 1 second delay on 429 rate limit errors.
     async fn get<T: serde::de::DeserializeOwned>(&self, url: &str) -> Result<ApiResponse<T>> {
-        Ok(retry_api!(self, |token| {
-            self.token_manager
-                .http_client()
-                .get(url)
-                .header("Authorization", format!("Bearer {}", token))
-                .header("Platform", "open_platform")
-                .send()
-        }))
+        self.get_with_timeout::<T>(url, None).await
     }
 
-    /// Make an authenticated GET request without timeout.
-    /// Used for file listing which can take a long time for large directories.
-    /// Retries on 429 rate limit errors.
     async fn get_no_timeout<T: serde::de::DeserializeOwned>(
         &self,
         url: &str,
     ) -> Result<ApiResponse<T>> {
-        Ok(retry_api!(self, |token| {
-            self.token_manager
-                .http_client()
-                .get(url)
-                .timeout(std::time::Duration::MAX) // No timeout
-                .header("Authorization", format!("Bearer {}", token))
-                .header("Platform", "open_platform")
-                .send()
-        }))
+        self.get_with_timeout::<T>(url, Some(std::time::Duration::MAX))
+            .await
     }
 
-    /// Make an authenticated POST request with JSON body and 429 retry support.
-    /// Retries up to 3 times with 1 second delay on 429 rate limit errors.
+    async fn get_with_timeout<T: serde::de::DeserializeOwned>(
+        &self,
+        url: &str,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<ApiResponse<T>> {
+        self.retry_api(|token| {
+            let mut request = self
+                .token_manager
+                .http_client()
+                .get(url)
+                .header("Authorization", format!("Bearer {}", token))
+                .header("Platform", "open_platform");
+
+            if let Some(timeout) = timeout {
+                request = request.timeout(timeout);
+            }
+
+            request.send()
+        })
+        .await
+    }
+
     async fn post<T: serde::de::DeserializeOwned, B: serde::Serialize>(
         &self,
         url: &str,
         body: &B,
     ) -> Result<ApiResponse<T>> {
-        // Serialize body once for reuse in retries
         let body_json = serde_json::to_string(body)?;
 
-        Ok(retry_api!(self, |token| {
+        self.retry_api(|token| {
             self.token_manager
                 .http_client()
                 .post(url)
@@ -225,7 +223,8 @@ impl Pan123Client {
                 .header("Content-Type", "application/json")
                 .body(body_json.clone())
                 .send()
-        }))
+        })
+        .await
     }
 
     // ========================================================================
@@ -246,14 +245,16 @@ impl Pan123Client {
         // Fetch from API with 429 retry support
         let url = format!("{}/upload/v2/file/domain", BASE_URL);
 
-        let api_response: ApiResponse<Vec<String>> = retry_api!(self, |token| {
-            self.token_manager
-                .http_client()
-                .get(&url)
-                .header("Authorization", format!("Bearer {}", token))
-                .header("Platform", "open_platform")
-                .send()
-        });
+        let api_response: ApiResponse<Vec<String>> = self
+            .retry_api(|token| {
+                self.token_manager
+                    .http_client()
+                    .get(&url)
+                    .header("Authorization", format!("Bearer {}", token))
+                    .header("Platform", "open_platform")
+                    .send()
+            })
+            .await?;
 
         if !api_response.is_success() {
             return Err(AppError::Pan123Api {
@@ -295,17 +296,7 @@ impl Pan123Client {
             .await
             .map_err(|e| AppError::Internal(format!("DB error in list_files: {}", e)))?;
 
-        Ok(nodes
-            .into_iter()
-            .map(|n| FileInfo {
-                file_id: n.file_id,
-                filename: n.name,
-                file_type: if n.is_dir { 1 } else { 0 },
-                size: n.size,
-                parent_file_id: n.parent_id,
-                trashed: 0,
-            })
-            .collect())
+        Ok(nodes.into_iter().map(FileInfo::from).collect())
     }
 
     /// Fetch files from 123pan API (internal, bypasses cache).
@@ -364,12 +355,6 @@ impl Pan123Client {
         }
 
         Ok(all_files)
-    }
-
-    /// Invalidate the files cache for a specific directory.
-    /// Now a no-op as SQLite is always updated synchronously.
-    pub fn invalidate_files_cache(&self, _parent_id: i64) {
-        // No-op
     }
 
     /// Find a file by exact name in a directory.
@@ -633,27 +618,28 @@ impl Pan123Client {
         // Store data as Vec<u8> for reuse in retries
         let data_vec = data.to_vec();
 
-        let api_response: ApiResponse<SingleUploadData> = retry_api!(self, |token| {
-            // Create multipart form with duplicate=2 for atomic overwrite
-            let form = Form::new()
-                .text("parentFileID", parent_id.to_string())
-                .text("filename", filename.to_string())
-                .text("etag", md5_hash.clone())
-                .text("size", file_size.to_string())
-                .text("duplicate", "2") // Overwrite existing file atomically
-                .part(
-                    "file",
-                    Part::bytes(data_vec.clone()).file_name(filename.to_string()),
-                );
+        let api_response: ApiResponse<SingleUploadData> = self
+            .retry_api(|token| {
+                let form = Form::new()
+                    .text("parentFileID", parent_id.to_string())
+                    .text("filename", filename.to_string())
+                    .text("etag", md5_hash.clone())
+                    .text("size", file_size.to_string())
+                    .text("duplicate", "2")
+                    .part(
+                        "file",
+                        Part::bytes(data_vec.clone()).file_name(filename.to_string()),
+                    );
 
-            self.token_manager
-                .http_client()
-                .post(&upload_url)
-                .header("Authorization", format!("Bearer {}", token))
-                .header("Platform", "open_platform")
-                .multipart(form)
-                .send()
-        });
+                self.token_manager
+                    .http_client()
+                    .post(&upload_url)
+                    .header("Authorization", format!("Bearer {}", token))
+                    .header("Platform", "open_platform")
+                    .multipart(form)
+                    .send()
+            })
+            .await?;
 
         if !api_response.is_success() {
             return Err(AppError::Pan123Api {
@@ -798,12 +784,6 @@ impl Pan123Client {
                 message: response.message,
             });
         }
-
-        // Remove from DB (already removed by trash_file, but safe to repeat)
-        entity::Entity::delete_by_id(file_id)
-            .exec(&self.db)
-            .await
-            .map_err(|e| AppError::Internal(format!("Failed to delete file from DB: {}", e)))?;
 
         tracing::info!("Deleted file {} from persistent cache", file_id);
         Ok(())
@@ -1043,17 +1023,7 @@ impl Pan123Client {
                 AppError::Internal(format!("DB error in list_all_data_files (files): {}", e))
             })?;
 
-        Ok(files
-            .into_iter()
-            .map(|n| FileInfo {
-                file_id: n.file_id,
-                filename: n.name,
-                file_type: 0,
-                size: n.size,
-                parent_file_id: n.parent_id,
-                trashed: 0,
-            })
-            .collect())
+        Ok(files.into_iter().map(FileInfo::from).collect())
     }
 }
 

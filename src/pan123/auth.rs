@@ -10,6 +10,7 @@ use sea_orm::{
 use std::sync::Arc;
 
 use super::types::{AccessTokenData, AccessTokenRequest, ApiResponse};
+use super::{MAX_RETRIES, RETRY_DELAY};
 use crate::error::{AppError, Result};
 
 /// Base URL for 123pan Open Platform API.
@@ -141,8 +142,6 @@ impl TokenManager {
 
         tracing::info!("Refreshing 123pan access token");
 
-        const MAX_RETRIES: usize = 3;
-        const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
         let url = format!("{}/api/v1/access_token", BASE_URL);
 
         let request = AccessTokenRequest {

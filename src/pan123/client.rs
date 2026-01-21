@@ -1,7 +1,7 @@
 //! 123pan API client for file operations.
 
 use bytes::Bytes;
-use cached::{Cached, TimedCache};
+use cached::proc_macro::cached;
 use parking_lot::RwLock;
 use reqwest::multipart::{Form, Part};
 use std::sync::Arc;
@@ -23,6 +23,49 @@ use sea_orm::{
     *,
 };
 
+/// Cached helper function to fetch download URL from 123pan API.
+/// Cache expires after 5 minutes (300 seconds).
+#[cached(time = 300, result = true, key = "i64", convert = r#"{ file_id }"#)]
+async fn fetch_download_url_cached(
+    token: String,
+    file_id: i64,
+) -> Result<String> {
+    let client = reqwest::Client::new();
+    let url = format!("{}/api/v1/file/download_info?fileId={}", BASE_URL, file_id);
+    
+    let response = client
+        .get(&url)
+        .header("Platform", "open_platform")
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .map_err(|e| AppError::Internal(format!("Request failed: {}", e)))?;
+    
+    let text = response.text().await
+        .map_err(|e| AppError::Internal(format!("Failed to read response: {}", e)))?;
+    
+    let api_response: ApiResponse<DownloadInfoData> = serde_json::from_str(&text)
+        .map_err(|e| AppError::Pan123Api {
+            code: -1,
+            message: format!("Failed to parse response JSON: {}", e),
+        })?;
+    
+    if !api_response.is_success() {
+        if api_response.code == 5066 {
+            return Err(AppError::NotFound(format!("File {} not found", file_id)));
+        }
+        return Err(AppError::Pan123Api {
+            code: api_response.code,
+            message: api_response.message,
+        });
+    }
+    
+    let data = api_response.data
+        .ok_or_else(|| AppError::Internal("No data in download info response".to_string()))?;
+    
+    Ok(data.download_url)
+}
+
 /// Client for interacting with 123pan API.
 #[derive(Clone)]
 pub struct Pan123Client {
@@ -32,8 +75,6 @@ pub struct Pan123Client {
     pub(crate) db: DatabaseConnection,
     /// Upload domain (fetched dynamically)
     upload_domain: Arc<RwLock<Option<String>>>,
-    /// Cache for download URLs (5 minute TTL)
-    download_url_cache: Arc<RwLock<TimedCache<i64, String>>>,
 }
 
 impl Pan123Client {
@@ -136,7 +177,6 @@ impl Pan123Client {
             repo_path,
             db,
             upload_domain: Arc::new(RwLock::new(None)),
-            download_url_cache: Arc::new(RwLock::new(TimedCache::with_lifespan(300))),
         };
 
         client.init_db().await?;
@@ -697,43 +737,8 @@ impl Pan123Client {
 
     /// Get download URL for a file.
     pub async fn get_download_url(&self, file_id: i64) -> Result<String> {
-        // Check cache first
-        {
-            let mut cache = self.download_url_cache.write();
-            if let Some(url) = cache.cache_get(&file_id) {
-                tracing::debug!("Cache hit for download URL of file {}", file_id);
-                return Ok(url.clone());
-            }
-        }
-
-        // Cache miss - fetch from API
-        tracing::debug!("Cache miss for download URL of file {}", file_id);
-        let url = format!("{}/api/v1/file/download_info?fileId={}", BASE_URL, file_id);
-        let response: ApiResponse<DownloadInfoData> = self.get(&url).await?;
-
-        if !response.is_success() {
-            if response.code == 5066 {
-                return Err(AppError::NotFound(format!("File {} not found", file_id)));
-            }
-            return Err(AppError::Pan123Api {
-                code: response.code,
-                message: response.message,
-            });
-        }
-
-        let data = response
-            .data
-            .ok_or_else(|| AppError::Internal("No data in download info response".to_string()))?;
-
-        let download_url = data.download_url;
-        
-        // Store in cache
-        {
-            let mut cache = self.download_url_cache.write();
-            cache.cache_set(file_id, download_url.clone());
-        }
-
-        Ok(download_url)
+        let token = self.token_manager.get_token().await?;
+        fetch_download_url_cached(token, file_id).await
     }
 
     /// Download a file's content with optional range support.

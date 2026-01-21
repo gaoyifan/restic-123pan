@@ -4,7 +4,7 @@ use bytes::Bytes;
 use cached::proc_macro::cached;
 use parking_lot::RwLock;
 use reqwest::multipart::{Form, Part};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use super::auth::{TokenManager, BASE_URL};
 use super::entity;
@@ -23,6 +23,9 @@ use sea_orm::{
     *,
 };
 
+/// Shared HTTP client for cached download URL requests.
+static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| reqwest::Client::new());
+
 /// Cached helper function to fetch download URL from 123pan API.
 /// Cache expires after 5 minutes (300 seconds).
 #[cached(time = 300, result = true, key = "i64", convert = r#"{ file_id }"#)]
@@ -30,10 +33,9 @@ async fn fetch_download_url_cached(
     token: String,
     file_id: i64,
 ) -> Result<String> {
-    let client = reqwest::Client::new();
     let url = format!("{}/api/v1/file/download_info?fileId={}", BASE_URL, file_id);
     
-    let response = client
+    let response = HTTP_CLIENT
         .get(&url)
         .header("Platform", "open_platform")
         .header("Authorization", format!("Bearer {}", token))

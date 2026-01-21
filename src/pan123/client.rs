@@ -1,6 +1,7 @@
 //! 123pan API client for file operations.
 
 use bytes::Bytes;
+use cached::{Cached, TimedCache};
 use parking_lot::RwLock;
 use reqwest::multipart::{Form, Part};
 use std::sync::Arc;
@@ -31,6 +32,8 @@ pub struct Pan123Client {
     pub(crate) db: DatabaseConnection,
     /// Upload domain (fetched dynamically)
     upload_domain: Arc<RwLock<Option<String>>>,
+    /// Cache for download URLs (5 minute TTL)
+    download_url_cache: Arc<RwLock<TimedCache<i64, String>>>,
 }
 
 impl Pan123Client {
@@ -133,6 +136,7 @@ impl Pan123Client {
             repo_path,
             db,
             upload_domain: Arc::new(RwLock::new(None)),
+            download_url_cache: Arc::new(RwLock::new(TimedCache::with_lifespan(300))),
         };
 
         client.init_db().await?;
@@ -693,6 +697,17 @@ impl Pan123Client {
 
     /// Get download URL for a file.
     pub async fn get_download_url(&self, file_id: i64) -> Result<String> {
+        // Check cache first
+        {
+            let mut cache = self.download_url_cache.write();
+            if let Some(url) = cache.cache_get(&file_id) {
+                tracing::debug!("Cache hit for download URL of file {}", file_id);
+                return Ok(url.clone());
+            }
+        }
+
+        // Cache miss - fetch from API
+        tracing::debug!("Cache miss for download URL of file {}", file_id);
         let url = format!("{}/api/v1/file/download_info?fileId={}", BASE_URL, file_id);
         let response: ApiResponse<DownloadInfoData> = self.get(&url).await?;
 
@@ -710,7 +725,15 @@ impl Pan123Client {
             .data
             .ok_or_else(|| AppError::Internal("No data in download info response".to_string()))?;
 
-        Ok(data.download_url)
+        let download_url = data.download_url;
+        
+        // Store in cache
+        {
+            let mut cache = self.download_url_cache.write();
+            cache.cache_set(file_id, download_url.clone());
+        }
+
+        Ok(download_url)
     }
 
     /// Download a file's content with optional range support.

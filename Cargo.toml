@@ -1,6 +1,6 @@
 [package]
 name = "restic-123pan"
-version = "0.2.4"
+version = "0.2.5"
 edition = "2021"
 description = "Restic REST API backend server using 123pan cloud storage"
 repository = "https://github.com/gaoyifan/restic-123pan"

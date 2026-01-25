@@ -858,40 +858,19 @@ impl Pan123Client {
 
     /// Warm up the cache by pre-fetching all directory IDs and file listings.
     /// This should be called during startup before the server starts accepting requests.
-    /// If force_rebuild is false and the cache is not empty, it will reuse the existing cache.
+    /// Resumes from where it left off if interrupted.
     pub async fn warm_cache(&self, force_rebuild: bool) -> Result<()> {
         let start = std::time::Instant::now();
-
-        // Check cache status
-        let count = entity::Entity::find()
-            .count(&self.db)
-            .await
-            .map_err(|e| AppError::Internal(format!("Failed to count cache entries: {}", e)))?;
-
-        if !force_rebuild && count > 0 {
-            tracing::info!(
-                "Reusing existing cache with {} entries for repository: {}",
-                count,
-                self.repo_path
-            );
-            return Ok(());
-        }
 
         tracing::info!(
             "{} cache for repository: {}",
             if force_rebuild {
                 "Rebuilding"
             } else {
-                "Initializing"
+                "Warming up (resumable)"
             },
             self.repo_path
         );
-
-        // Clear existing cache for a fresh start or if forced
-        entity::Entity::delete_many()
-            .exec(&self.db)
-            .await
-            .map_err(|e| AppError::Internal(format!("DB clear failed: {}", e)))?;
 
         // 1. Resolve repo_path root
         let parts: Vec<&str> = self
@@ -904,32 +883,18 @@ impl Pan123Client {
 
         let mut current_id: i64 = 0;
         for part in parts {
-            let files = self.fetch_files_from_api(current_id).await?;
+            // We use fetch_or_use_cache here to avoid API calls if the path is already cached
+            let (files, cached) = self.fetch_or_use_cache(current_id, force_rebuild).await?;
+            
             let found = files
                 .into_iter()
                 .find(|f| f.filename == part && f.is_folder());
 
             match found {
                 Some(found) => {
-                    // Insert this path component into DB
-                    entity::Entity::insert(entity::ActiveModel {
-                        file_id: Set(found.file_id),
-                        parent_id: Set(current_id),
-                        name: Set(found.filename.clone()),
-                        is_dir: Set(true),
-                        size: Set(0),
-                        etag: Set(None),
-                        updated_at: Set(chrono::Utc::now().naive_utc()),
-                    })
-                    .exec(&self.db)
-                    .await
-                    .map_err(|e| {
-                        AppError::Internal(format!(
-                            "Failed to insert path component into DB: {}",
-                            e
-                        ))
-                    })?;
-
+                    if !cached {
+                         tracing::debug!("Found path component '{}' via API", part);
+                    }
                     current_id = found.file_id;
                 }
                 None => {
@@ -944,17 +909,77 @@ impl Pan123Client {
 
         // 2. Recursively crawl everything under repo_path
         let mut queue = vec![(current_id, self.repo_path.clone())];
+        let mut fetched_count = 0;
+        let mut cached_count = 0;
 
         while let Some((parent_id, path)) = queue.pop() {
-            tracing::debug!("Crawling directory: {}", path);
-            let files = self.fetch_files_from_api(parent_id).await?;
-
-            if files.is_empty() {
-                continue;
+            let (files, cached) = self.fetch_or_use_cache(parent_id, force_rebuild).await?;
+            
+            if cached {
+                cached_count += 1;
+                tracing::debug!("Cache hit for directory: {}", path);
+            } else {
+                fetched_count += 1;
+                tracing::info!("Fetched directory: {} ({} files)", path, files.len());
             }
 
-            let mut models = Vec::with_capacity(files.len());
-            for f in &files {
+            for f in files {
+                if f.is_folder() {
+                    queue.push((f.file_id, format!("{}/{}", path, f.filename)));
+                }
+            }
+        }
+
+        tracing::info!(
+            "Cache warm-up completed in {:?}. Fetched {} dirs, cached {} dirs.", 
+            start.elapsed(),
+            fetched_count,
+            cached_count
+        );
+        Ok(())
+    }
+
+    async fn cache_has_children(&self, parent_id: i64) -> Result<bool> {
+        let count = entity::Entity::find()
+            .filter(entity::Column::ParentId.eq(parent_id))
+            .count(&self.db)
+            .await
+            .map_err(|e| AppError::Internal(format!("DB count fail: {}", e)))?;
+        Ok(count > 0)
+    }
+
+    async fn fetch_or_use_cache(
+        &self,
+        parent_id: i64,
+        force_rebuild: bool,
+    ) -> Result<(Vec<FileInfo>, bool)> {
+        if !force_rebuild && self.cache_has_children(parent_id).await? {
+            let files = self.list_files(parent_id).await?;
+            return Ok((files, true));
+        }
+
+        let files = self.fetch_files_from_api(parent_id).await?;
+        self.save_files_to_db(parent_id, &files).await?;
+        Ok((files, false))
+    }
+
+    async fn save_files_to_db(&self, parent_id: i64, files: &[FileInfo]) -> Result<()> {
+        let txn = self
+            .db
+            .begin()
+            .await
+            .map_err(|e| AppError::Internal(format!("DB begin fail: {}", e)))?;
+
+        // Delete existing entries for this parent to avoid stale entries
+        entity::Entity::delete_many()
+            .filter(entity::Column::ParentId.eq(parent_id))
+            .exec(&txn)
+            .await
+            .map_err(|e| AppError::Internal(format!("DB delete fail: {}", e)))?;
+
+        if !files.is_empty() {
+             let mut models = Vec::with_capacity(files.len());
+             for f in files {
                 models.push(entity::ActiveModel {
                     file_id: Set(f.file_id),
                     parent_id: Set(parent_id),
@@ -966,28 +991,20 @@ impl Pan123Client {
                 });
             }
 
-            // SQLite parameter limit is usually 999.
-            // Each row has 7 columns. 50 * 7 = 350, which is safe.
+            // Chunking for SQLite limits
             for chunk in models.chunks(50) {
                 entity::Entity::insert_many(chunk.to_vec())
-                    .exec(&self.db)
+                    .exec(&txn)
                     .await
                     .map_err(|e| {
-                        AppError::Internal(format!(
-                            "Failed to batch insert files in warm_cache: {}",
-                            e
-                        ))
+                        AppError::Internal(format!("DB batch insert fail: {}", e))
                     })?;
-            }
-
-            for f in files {
-                if f.is_folder() {
-                    queue.push((f.file_id, format!("{}/{}", path, f.filename)));
-                }
             }
         }
 
-        tracing::info!("Cache warm-up completed in {:?}", start.elapsed());
+        txn.commit()
+            .await
+            .map_err(|e| AppError::Internal(format!("DB commit fail: {}", e)))?;
         Ok(())
     }
     /// List all data files across all 2-char subdirectories.

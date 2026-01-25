@@ -155,6 +155,23 @@ impl Pan123Client {
             .await
             .map_err(|e| AppError::Internal(format!("Failed to initialize database: {}", e)))?;
 
+        // Create indexes from entity definitions (#[sea_orm(indexed)] attributes)
+        // create_index_from_entity generates CREATE INDEX statements, but doesn't support IF NOT EXISTS,
+        // so we ignore "already exists" errors.
+        for index_stmt in schema.create_index_from_entity(entity::Entity) {
+            let sql = builder.build(&index_stmt);
+            if let Err(e) = self.db.execute(sql).await {
+                // Ignore "index already exists" errors (SQLite error code for this)
+                let err_str = e.to_string();
+                if !err_str.contains("already exists") {
+                    return Err(AppError::Internal(format!(
+                        "Failed to create index from entity: {}",
+                        e
+                    )));
+                }
+            }
+        }
+
         // Add composite unique index for lookup efficiency and name uniqueness
         let index_stmt = Index::create()
             .name("idx_parent_name")

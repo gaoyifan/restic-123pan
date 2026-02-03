@@ -10,7 +10,8 @@ services:
       - PAN123_CLIENT_ID=${PAN123_CLIENT_ID}
       - PAN123_CLIENT_SECRET=${PAN123_CLIENT_SECRET}
       - PAN123_REPO_PATH=${PAN123_REPO_PATH:-/restic-backup}
-      - LISTEN_ADDR=${LISTEN_ADDR:-0.0.0.0:8000}
+      - LISTEN_ADDR=${LISTEN_ADDR:-0.0.0.0}
+      - LISTEN_PORT=${LISTEN_PORT:-8000}
       - RUST_LOG=${RUST_LOG:-info}
       - DB_PATH=${DB_PATH:-cache/cache-123pan.db}
     volumes:

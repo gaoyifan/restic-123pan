@@ -30,7 +30,8 @@ cargo build --release
 | `PAN123_CLIENT_ID` | 123pan Open Platform client ID | (required) |
 | `PAN123_CLIENT_SECRET` | 123pan Open Platform client secret | (required) |
 | `PAN123_REPO_PATH` | Root folder path on 123pan | `/restic-backup` |
-| `LISTEN_ADDR` | Server listen address | `127.0.0.1:8000` |
+| `LISTEN_ADDR` | Server listen address (host/IP) | `127.0.0.1` |
+| `LISTEN_PORT` | Server listen port | `8000` |
 | `RUST_LOG` | Log level (trace, debug, info, warn, error) | `info` |
 
 ### Running the Server
@@ -46,7 +47,8 @@ cargo run --release -- \
   --client-id your_client_id \
   --client-secret your_client_secret \
   --repo-path /my-restic-backup \
-  --listen-addr 0.0.0.0:8000
+  --listen-addr 0.0.0.0 \
+  --listen-port 8000
 ```
 
 ### Using with Restic

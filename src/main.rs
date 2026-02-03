@@ -28,7 +28,11 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("Starting restic-123pan");
     tracing::info!("Repository path: {}", config.repo_path);
-    tracing::info!("Listen address: {}", config.listen_addr);
+    tracing::info!(
+        "Listen address: {}:{}",
+        config.listen_addr,
+        config.listen_port
+    );
 
     // Ensure database directory exists
     let db_path = std::path::Path::new(&config.db_path);
@@ -56,7 +60,7 @@ async fn main() -> anyhow::Result<()> {
     let app = create_router(client).layer(TraceLayer::new_for_http());
 
     // Parse listen address
-    let addr: SocketAddr = config.listen_addr.parse()?;
+    let addr: SocketAddr = format!("{}:{}", config.listen_addr, config.listen_port).parse()?;
 
     tracing::info!("Server listening on http://{}", addr);
 

@@ -820,16 +820,18 @@ impl Pan123Client {
             }
         }
 
-        let mut probe_request = self
-            .token_manager
-            .http_client()
+        // Probe with redirect disabled and a 0-0 range to avoid downloading full content.
+        let probe_client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|e| AppError::Internal(format!("Failed to build probe client: {}", e)))?;
+        let probe = probe_client
             .get(&resolved_url)
-            .header("referer", "https://www.123pan.com/");
-        if let Some((start, end)) = range {
-            probe_request = probe_request.header("Range", format!("bytes={}-{}", start, end));
-        }
-
-        let probe = probe_request.send().await?;
+            .header("referer", "https://www.123pan.com/")
+            .header("Range", "bytes=0-0")
+            .send()
+            .await?;
         let final_url = if probe.status().is_redirection() {
             probe
                 .headers()
@@ -838,16 +840,43 @@ impl Pan123Client {
                 .map(|s| s.to_string())
                 .unwrap_or(resolved_url)
         } else if probe.status().is_success() {
-            let text = probe.text().await?;
-            serde_json::from_str::<serde_json::Value>(&text)
-                .ok()
-                .and_then(|j| {
-                    j.get("data")
-                        .and_then(|d| d.get("redirect_url"))
-                        .and_then(|u| u.as_str())
-                        .map(|u| u.to_string())
-                })
-                .unwrap_or(resolved_url)
+            let is_json = probe
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .map(|ct| ct.contains("application/json"))
+                .unwrap_or(false);
+
+            if is_json {
+                let mut probe = probe;
+                let mut buf = Vec::new();
+                const MAX_JSON_BYTES: usize = 64 * 1024;
+                while let Some(chunk) = probe.chunk().await? {
+                    let remaining = MAX_JSON_BYTES.saturating_sub(buf.len());
+                    if remaining == 0 {
+                        break;
+                    }
+                    if chunk.len() > remaining {
+                        buf.extend_from_slice(&chunk[..remaining]);
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk);
+                }
+
+                let text = String::from_utf8_lossy(&buf);
+                serde_json::from_str::<serde_json::Value>(&text)
+                    .ok()
+                    .and_then(|j| {
+                        j.get("data")
+                            .and_then(|d| d.get("redirect_url"))
+                            .and_then(|u| u.as_str())
+                            .map(|u| u.to_string())
+                    })
+                    .unwrap_or(resolved_url)
+            } else {
+                // For non-JSON success responses, treat resolved_url as final.
+                resolved_url
+            }
         } else {
             return Err(AppError::Internal(format!(
                 "Download probe failed with status: {}",

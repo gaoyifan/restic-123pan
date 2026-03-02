@@ -7,7 +7,7 @@ Guidance for AI agents working with the restic-123pan codebase.
 Rust REST API server implementing Restic backup tool's REST backend protocol (v2 only), using 123pan cloud storage as the storage provider.
 
 ```
-restic CLI  <--REST API-->  This Server  <--HTTPS-->  123pan Open Platform
+restic CLI  <--REST API-->  This Server  <--HTTPS-->  123pan Client API
 ```
 
 ## Build, Test Commands
@@ -124,8 +124,8 @@ Use `retry_api!` macro for 429 (rate limit) and 401 (token expired) handling.
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `PAN123_CLIENT_ID` | Yes | - | 123pan client ID |
-| `PAN123_CLIENT_SECRET` | Yes | - | 123pan client secret |
+| `PAN123_USERNAME` | Yes | - | 123pan username (phone/email) |
+| `PAN123_PASSWORD` | Yes | - | 123pan account password |
 | `PAN123_REPO_PATH` | No | `/restic-backup` | Root path on 123pan |
 | `LISTEN_ADDR` | No | `127.0.0.1:8000` | Server bind address |
 | `RUST_LOG` | No | `info` | Log level |

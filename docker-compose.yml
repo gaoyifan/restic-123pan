@@ -7,8 +7,8 @@ services:
     restart: unless-stopped
     network_mode: host
     environment:
-      - PAN123_CLIENT_ID=${PAN123_CLIENT_ID}
-      - PAN123_CLIENT_SECRET=${PAN123_CLIENT_SECRET}
+      - PAN123_USERNAME=${PAN123_USERNAME}
+      - PAN123_PASSWORD=${PAN123_PASSWORD}
       - PAN123_REPO_PATH=${PAN123_REPO_PATH:-/restic-backup}
       - LISTEN_ADDR=${LISTEN_ADDR:-0.0.0.0}
       - LISTEN_PORT=${LISTEN_PORT:-8000}

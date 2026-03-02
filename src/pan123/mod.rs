@@ -13,7 +13,7 @@ mod tests;
 
 pub use client::Pan123Client;
 pub use types::{
-    AccessTokenData, AccessTokenRequest, ApiResponse, CreateDirData, CreateDirRequest,
-    DeleteRequest, DownloadInfoData, FileInfo, FileListData, MoveRequest, SingleUploadData,
-    TrashRequest,
+    ApiResponse, CreateDirData, CreateDirRequest, DeleteRequest, DownloadInfoData, FileInfo,
+    FileListData, MoveRequest, S3AuthData, SignInData, SignInRequest, SignInResponse,
+    SingleUploadData, TrashRequest, UploadCompleteV2Data, UploadRequestData,
 };

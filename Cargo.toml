@@ -34,6 +34,8 @@ clap = { version = "4", features = ["derive", "env"] }
 # Utilities
 chrono = { version = "0.4", features = ["serde"] }
 md5 = "0.7"
+base64 = "0.22"
+crc32fast = "1"
 bytes = "1"
 parking_lot = "0.12"
 log = "0.4"

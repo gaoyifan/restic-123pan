@@ -1,8 +1,8 @@
 //! Integration tests for 123pan API operations.
 //!
 //! These tests require the following environment variables:
-//! - PAN123_CLIENT_ID
-//! - PAN123_CLIENT_SECRET
+//! - PAN123_USERNAME
+//! - PAN123_PASSWORD
 
 use bytes::Bytes;
 use rand::Rng;
@@ -12,8 +12,8 @@ use std::env;
 
 /// Get test credentials from environment.
 fn get_test_credentials() -> Option<(String, String)> {
-    let client_id = env::var("PAN123_CLIENT_ID").ok()?;
-    let client_secret = env::var("PAN123_CLIENT_SECRET").ok()?;
+    let client_id = env::var("PAN123_USERNAME").ok()?;
+    let client_secret = env::var("PAN123_PASSWORD").ok()?;
     Some((client_id, client_secret))
 }
 
@@ -21,85 +21,10 @@ fn get_test_credentials() -> Option<(String, String)> {
 macro_rules! skip_if_no_credentials {
     () => {
         if get_test_credentials().is_none() {
-            eprintln!("Skipping test: PAN123_CLIENT_ID and PAN123_CLIENT_SECRET not set");
+            eprintln!("Skipping test: PAN123_USERNAME and PAN123_PASSWORD not set");
             return;
         }
     };
-}
-
-/// Get an access token from 123pan with exponential backoff on rate limiting.
-async fn get_access_token(client_id: &str, client_secret: &str) -> Result<String, String> {
-    let client = reqwest::Client::new();
-    let mut delay = std::time::Duration::from_millis(200);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-
-    loop {
-        let response = client
-            .post("https://open-api.123pan.com/api/v1/access_token")
-            .header("Platform", "open_platform")
-            .header("Content-Type", "application/json")
-            .json(&serde_json::json!({
-                "clientID": client_id,
-                "clientSecret": client_secret
-            }))
-            .send()
-            .await
-            .map_err(|e| format!("Failed to send request: {}", e))?;
-
-        let body: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|e| format!("Failed to parse response: {}", e))?;
-
-        if body["code"] == 429 {
-            if std::time::Instant::now() >= deadline {
-                return Err("Rate limited for over 60s while fetching access token".to_string());
-            }
-            tokio::time::sleep(delay).await;
-            delay = std::cmp::min(delay * 2, std::time::Duration::from_secs(5));
-            continue;
-        }
-
-        if body["code"] != 0 {
-            return Err(format!("API error: {}", body["message"]));
-        }
-
-        return Ok(body["data"]["accessToken"]
-            .as_str()
-            .ok_or_else(|| "No access token".to_string())?
-            .to_string());
-    }
-}
-
-/// Perform a JSON API request with exponential backoff on rate limiting (code 429).
-async fn request_json_with_backoff<F, Fut>(mut f: F) -> Result<serde_json::Value, String>
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<reqwest::Response, reqwest::Error>>,
-{
-    let mut delay = std::time::Duration::from_millis(200);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-
-    loop {
-        let response = f()
-            .await
-            .map_err(|e| format!("Failed to send request: {}", e))?;
-        let body: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|e| format!("Failed to parse response: {}", e))?;
-
-        if body["code"] == 429 {
-            if std::time::Instant::now() >= deadline {
-                return Err("Rate limited for over 60s during API request".to_string());
-            }
-            tokio::time::sleep(delay).await;
-            delay = std::cmp::min(delay * 2, std::time::Duration::from_secs(5));
-            continue;
-        }
-
-        return Ok(body);
-    }
 }
 
 /// Retry an operation on 429 rate limiting with exponential backoff up to 60s.
@@ -141,213 +66,59 @@ where
 async fn test_authentication() {
     skip_if_no_credentials!();
 
-    let (client_id, client_secret) = get_test_credentials().unwrap();
-
-    let token = get_access_token(&client_id, &client_secret)
+    let db_file = tempfile::NamedTempFile::new().unwrap();
+    let db_url = format!("sqlite:{}?mode=rwc", db_file.path().display());
+    let (username, password) = get_test_credentials().unwrap();
+    let client = Pan123Client::new(username, password, "/auth-test".to_string(), &db_url)
         .await
-        .expect("Failed to get access token");
-    assert!(!token.is_empty(), "Access token should not be empty");
+        .expect("Failed to create client");
+
+    let root_files = retry_on_rate_limit(|| client.list_files(0))
+        .await
+        .expect("Failed to list root");
+    println!("Root files count: {}", root_files.len());
 }
 
 #[tokio::test]
 async fn test_list_root_directory() {
     skip_if_no_credentials!();
 
-    let (client_id, client_secret) = get_test_credentials().unwrap();
-    let access_token = get_access_token(&client_id, &client_secret)
+    let repo_path = unique_test_path();
+    let db_file = tempfile::NamedTempFile::new().unwrap();
+    let db_url = format!("sqlite:{}?mode=rwc", db_file.path().display());
+    let client = create_test_client(&repo_path, &db_url).await.unwrap();
+    let dir_id = retry_on_rate_limit(|| client.ensure_path(&repo_path))
         .await
-        .expect("Failed to get access token");
-
-    let client = reqwest::Client::new();
-    let list_body = request_json_with_backoff(|| {
-        client
-            .get("https://open-api.123pan.com/api/v2/file/list")
-            .header("Platform", "open_platform")
-            .header("Authorization", format!("Bearer {}", access_token))
-            .query(&[("parentFileId", "0"), ("limit", "10")])
-            .send()
-    })
-    .await
-    .expect("Failed to list root directory");
-
-    println!("List response: {:?}", list_body);
-
-    assert_eq!(list_body["code"], 0, "API error: {}", list_body["message"]);
-}
-
-#[tokio::test]
-async fn test_get_upload_domain() {
-    skip_if_no_credentials!();
-
-    let (client_id, client_secret) = get_test_credentials().unwrap();
-    let access_token = get_access_token(&client_id, &client_secret)
+        .expect("Failed to create test path");
+    let files = retry_on_rate_limit(|| client.list_files(0))
         .await
-        .expect("Failed to get access token");
-
-    let client = reqwest::Client::new();
-    let body = request_json_with_backoff(|| {
-        client
-            .get("https://open-api.123pan.com/upload/v2/file/domain")
-            .header("Platform", "open_platform")
-            .header("Authorization", format!("Bearer {}", access_token))
-            .send()
-    })
-    .await
-    .expect("Failed to get upload domain");
-
-    println!("Upload domain response: {:?}", body);
-
-    assert_eq!(body["code"], 0, "API error: {}", body["message"]);
-
-    let domains = body["data"].as_array().expect("data should be an array");
-    assert!(
-        !domains.is_empty(),
-        "Should have at least one upload domain"
-    );
-
-    let domain = domains[0].as_str().expect("domain should be a string");
-    println!("Got upload domain: {}", domain);
-    assert!(
-        domain.starts_with("https://"),
-        "Domain should start with https://"
-    );
+        .expect("Failed to list root");
+    assert!(!files.is_empty(), "Root should contain at least one directory");
+    let _ = client.delete_file(0, dir_id).await;
 }
 
 #[tokio::test]
 async fn test_create_and_delete_directory() {
     skip_if_no_credentials!();
 
-    let (client_id, client_secret) = get_test_credentials().unwrap();
-    let access_token = get_access_token(&client_id, &client_secret)
+    let repo_path = unique_test_path();
+    let db_file = tempfile::NamedTempFile::new().unwrap();
+    let db_url = format!("sqlite:{}?mode=rwc", db_file.path().display());
+    let client = create_test_client(&repo_path, &db_url).await.unwrap();
+
+    let dir_id = retry_on_rate_limit(|| client.ensure_path(&repo_path))
         .await
-        .expect("Failed to get access token");
-
-    // First get the upload domain
-    let client = reqwest::Client::new();
-    let domain_body = request_json_with_backoff(|| {
-        client
-            .get("https://open-api.123pan.com/upload/v2/file/domain")
-            .header("Platform", "open_platform")
-            .header("Authorization", format!("Bearer {}", access_token))
-            .send()
-    })
-    .await
-    .expect("Failed to get upload domain");
-    let upload_domain = domain_body["data"][0].as_str().expect("No upload domain");
-
-    println!("Using upload domain: {}", upload_domain);
-
-    // Create a test directory using mkdir API (uses base URL, not upload domain)
-    let test_dir_name = format!("test-dir-{}", chrono::Utc::now().timestamp());
-
-    let mkdir_body = request_json_with_backoff(|| {
-        client
-            .post("https://open-api.123pan.com/upload/v1/file/mkdir")
-            .header("Platform", "open_platform")
-            .header("Authorization", format!("Bearer {}", access_token))
-            .header("Content-Type", "application/json")
-            .json(&serde_json::json!({
-                "name": test_dir_name,
-                "parentID": 0
-            }))
-            .send()
-    })
-    .await
-    .expect("Failed to create directory");
-
-    println!("Mkdir response: {:?}", mkdir_body);
-
-    assert_eq!(
-        mkdir_body["code"], 0,
-        "API error: {}",
-        mkdir_body["message"]
-    );
-
-    let dir_id = mkdir_body["data"]["dirID"]
-        .as_i64()
-        .expect("No dirID in response");
-    println!("Created directory '{}' with ID: {}", test_dir_name, dir_id);
-
-    // Clean up: move to trash then delete
-    let trash_body = request_json_with_backoff(|| {
-        client
-            .post("https://open-api.123pan.com/api/v1/file/trash")
-            .header("Platform", "open_platform")
-            .header("Authorization", format!("Bearer {}", access_token))
-            .header("Content-Type", "application/json")
-            .json(&serde_json::json!({
-                "fileIDs": [dir_id]
-            }))
-            .send()
-    })
-    .await
-    .expect("Failed to trash directory");
-    println!("Trash response: {:?}", trash_body);
-
-    let delete_body = request_json_with_backoff(|| {
-        client
-            .post("https://open-api.123pan.com/api/v1/file/delete")
-            .header("Platform", "open_platform")
-            .header("Authorization", format!("Bearer {}", access_token))
-            .header("Content-Type", "application/json")
-            .json(&serde_json::json!({
-                "fileIDs": [dir_id]
-            }))
-            .send()
-    })
-    .await
-    .expect("Failed to delete directory");
-    println!("Delete response: {:?}", delete_body);
-    assert_eq!(
-        delete_body["code"], 0,
-        "Delete failed: {}",
-        delete_body["message"]
-    );
-
-    println!("Directory created and deleted successfully");
-}
-
-#[tokio::test]
-async fn test_search_mode() {
-    skip_if_no_credentials!();
-
-    let (client_id, client_secret) = get_test_credentials().unwrap();
-    let access_token = get_access_token(&client_id, &client_secret)
+        .expect("Failed to create directory");
+    client
+        .delete_file(0, dir_id)
         .await
-        .expect("Failed to get access token");
+        .expect("Failed to delete directory");
 
-    // Test searchMode=1 for precise search
-    let client = reqwest::Client::new();
-    let body = request_json_with_backoff(|| {
-        client
-            .get("https://open-api.123pan.com/api/v2/file/list")
-            .header("Platform", "open_platform")
-            .header("Authorization", format!("Bearer {}", access_token))
-            .query(&[
-                ("parentFileId", "0"),
-                ("limit", "10"),
-                ("searchMode", "1"),
-                ("searchData", "nonexistent-file-name-12345"),
-            ])
-            .send()
-    })
-    .await
-    .expect("Failed to search file");
-
-    println!("Search response: {:?}", body);
-
-    assert_eq!(body["code"], 0, "API error: {}", body["message"]);
-
-    // Should return empty list for nonexistent file
-    let file_list = body["data"]["fileList"]
-        .as_array()
-        .expect("fileList should be array");
-    assert!(
-        file_list.is_empty(),
-        "Should return empty list for nonexistent file"
-    );
-
-    println!("Search mode test passed");
+    let found = client
+        .find_path_id(&repo_path)
+        .await
+        .expect("find_path_id failed");
+    assert!(found.is_none(), "Directory should be deleted");
 }
 
 // ============================================================================

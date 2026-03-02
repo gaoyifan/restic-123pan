@@ -1,6 +1,7 @@
 //! 123pan API request and response types.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// Base API response wrapper from 123pan.
 #[derive(Debug, Deserialize)]
@@ -17,24 +18,29 @@ impl<T> ApiResponse<T> {
     }
 }
 
-// ============================================================================
-// Authentication
-// ============================================================================
-
-/// Request body for getting access token.
+/// Request body for `sign_in`.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct AccessTokenRequest {
-    pub client_id: String,
-    pub client_secret: String,
+pub struct SignInRequest {
+    pub passport: String,
+    pub password: String,
+    pub remember: bool,
 }
 
-/// Response data for access token.
+/// Response data for `sign_in`.
 #[derive(Debug, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
-pub struct AccessTokenData {
-    pub access_token: String,
-    pub expired_at: String,
+pub struct SignInData {
+    pub token: String,
+    pub expire: String,
+}
+
+/// Dedicated response for sign-in (success code is 200, not 0).
+#[derive(Debug, Deserialize, Clone)]
+pub struct SignInResponse {
+    pub code: i32,
+    pub message: String,
+    pub data: Option<SignInData>,
 }
 
 // ============================================================================
@@ -45,15 +51,24 @@ pub struct AccessTokenData {
 #[derive(Debug, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct FileInfo {
+    #[serde(alias = "FileId")]
     pub file_id: i64,
+    #[serde(alias = "FileName")]
     pub filename: String,
     #[serde(rename = "type")]
+    #[serde(alias = "Type")]
     pub file_type: i32, // 0 = file, 1 = folder
+    #[serde(alias = "Size")]
     pub size: i64,
     #[allow(dead_code)]
+    #[serde(alias = "ParentFileId")]
     pub parent_file_id: i64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_trashed")]
     pub trashed: i32, // 0 = not trashed, 1 = trashed
+    #[serde(alias = "Etag", default)]
+    pub etag: Option<String>,
+    #[serde(alias = "S3KeyFlag", default)]
+    pub s3_key_flag: Option<String>,
 }
 
 impl FileInfo {
@@ -68,6 +83,37 @@ impl FileInfo {
     }
 }
 
+fn deserialize_trashed<'de, D>(deserializer: D) -> std::result::Result<i32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Trashed {
+        Int(i32),
+        Bool(bool),
+    }
+
+    let v = Option::<Trashed>::deserialize(deserializer)?;
+    Ok(match v {
+        Some(Trashed::Int(i)) => {
+            if i == 0 {
+                0
+            } else {
+                1
+            }
+        }
+        Some(Trashed::Bool(b)) => {
+            if b {
+                1
+            } else {
+                0
+            }
+        }
+        None => 0,
+    })
+}
+
 impl From<crate::pan123::entity::Model> for FileInfo {
     fn from(model: crate::pan123::entity::Model) -> Self {
         Self {
@@ -77,6 +123,8 @@ impl From<crate::pan123::entity::Model> for FileInfo {
             size: model.size,
             parent_file_id: model.parent_id,
             trashed: 0,
+            etag: model.etag,
+            s3_key_flag: None,
         }
     }
 }
@@ -85,8 +133,29 @@ impl From<crate::pan123::entity::Model> for FileInfo {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FileListData {
+    #[serde(alias = "Next", default, deserialize_with = "deserialize_last_file_id")]
     pub last_file_id: i64,
+    #[serde(alias = "InfoList", default)]
     pub file_list: Vec<FileInfo>,
+}
+
+fn deserialize_last_file_id<'de, D>(deserializer: D) -> std::result::Result<i64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum NextId {
+        Int(i64),
+        String(String),
+    }
+
+    let v = Option::<NextId>::deserialize(deserializer)?;
+    Ok(match v {
+        Some(NextId::Int(i)) => i,
+        Some(NextId::String(s)) => s.parse().unwrap_or(-1),
+        None => -1,
+    })
 }
 
 /// Request body for creating a directory.
@@ -106,10 +175,30 @@ pub struct CreateDirData {
     pub dir_id: i64,
 }
 
+/// Response data for upload request API (legacy web client API).
+#[derive(Debug, Deserialize, Clone)]
+pub struct UploadRequestData {
+    #[serde(rename = "Key", default)]
+    pub key: String,
+    #[serde(rename = "Bucket", default)]
+    pub bucket: String,
+    #[serde(rename = "FileId", default)]
+    pub file_id: i64,
+    #[serde(rename = "Reuse", default)]
+    pub reuse: bool,
+    #[serde(rename = "Info", default)]
+    pub info: Option<FileInfo>,
+    #[serde(rename = "UploadId", default)]
+    pub upload_id: String,
+    #[serde(rename = "StorageNode", default)]
+    pub storage_node: String,
+}
+
 /// Response data for getting download URL.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DownloadInfoData {
+    #[serde(alias = "DownloadUrl")]
     pub download_url: String,
 }
 
@@ -146,4 +235,18 @@ pub struct SingleUploadData {
     #[serde(rename = "fileID")]
     pub file_id: i64,
     pub completed: bool,
+}
+
+/// Response data for s3 auth API.
+#[derive(Debug, Deserialize)]
+pub struct S3AuthData {
+    #[serde(rename = "presignedUrls", default)]
+    pub presigned_urls: HashMap<String, String>,
+}
+
+/// Response data for upload complete v2 API.
+#[derive(Debug, Deserialize)]
+pub struct UploadCompleteV2Data {
+    #[serde(rename = "file_info")]
+    pub file_info: FileInfo,
 }

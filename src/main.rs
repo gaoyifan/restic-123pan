@@ -45,8 +45,8 @@ async fn main() -> anyhow::Result<()> {
 
     // Create 123pan client
     let client = Pan123Client::new(
-        config.client_id.clone(),
-        config.client_secret.clone(),
+        config.username.clone(),
+        config.password.clone(),
         config.repo_path.clone(),
         &database_url,
     )

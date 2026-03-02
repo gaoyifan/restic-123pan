@@ -7,13 +7,13 @@ use clap::Parser;
 #[command(name = "restic-123pan")]
 #[command(about = "Restic REST API backend server using 123pan cloud storage")]
 pub struct Config {
-    /// 123pan client ID
-    #[arg(long, env = "PAN123_CLIENT_ID")]
-    pub client_id: String,
+    /// 123pan account username (phone/email)
+    #[arg(long, env = "PAN123_USERNAME")]
+    pub username: String,
 
-    /// 123pan client secret
-    #[arg(long, env = "PAN123_CLIENT_SECRET")]
-    pub client_secret: String,
+    /// 123pan account password
+    #[arg(long, env = "PAN123_PASSWORD")]
+    pub password: String,
 
     /// Root folder path on 123pan for the repository
     #[arg(long, env = "PAN123_REPO_PATH", default_value = "/restic-backup")]

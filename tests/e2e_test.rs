@@ -1,7 +1,7 @@
 //! End-to-end tests using the actual restic CLI.
 //!
 //! These tests require:
-//! - Environment variables: PAN123_CLIENT_ID, PAN123_CLIENT_SECRET
+//! - Environment variables: PAN123_USERNAME, PAN123_PASSWORD
 //! - restic CLI installed and available in PATH
 //!
 //! The tests will:
@@ -25,8 +25,8 @@ use tempfile::TempDir;
 
 /// Get test credentials from environment.
 fn get_test_credentials() -> Option<(String, String)> {
-    let client_id = env::var("PAN123_CLIENT_ID").ok()?;
-    let client_secret = env::var("PAN123_CLIENT_SECRET").ok()?;
+    let client_id = env::var("PAN123_USERNAME").ok()?;
+    let client_secret = env::var("PAN123_PASSWORD").ok()?;
     Some((client_id, client_secret))
 }
 
@@ -42,8 +42,8 @@ fn start_server(client_id: &str, client_secret: &str, port: u16, repo_path: &str
         .unwrap_or_else(|_| "target/debug/restic-123pan".to_string());
 
     let mut child = Command::new(&cargo_bin)
-        .env("PAN123_CLIENT_ID", client_id)
-        .env("PAN123_CLIENT_SECRET", client_secret)
+        .env("PAN123_USERNAME", client_id)
+        .env("PAN123_PASSWORD", client_secret)
         .env("PAN123_REPO_PATH", repo_path)
         .env("LISTEN_ADDR", "127.0.0.1")
         .env("LISTEN_PORT", port.to_string())
@@ -257,7 +257,7 @@ fn hash_directory(dir: &PathBuf) -> std::collections::HashMap<String, String> {
 macro_rules! skip_if_not_ready {
     () => {
         if get_test_credentials().is_none() {
-            eprintln!("Skipping test: PAN123_CLIENT_ID and PAN123_CLIENT_SECRET not set");
+            eprintln!("Skipping test: PAN123_USERNAME and PAN123_PASSWORD not set");
             return;
         }
 

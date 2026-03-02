@@ -12,7 +12,7 @@ A Restic REST API backend server that uses 123pan cloud storage as the storage p
 ## Requirements
 
 - Rust 1.70+
-- 123pan open platform credentials (client_id and client_secret)
+ - 123pan account credentials (username and password)
 - restic CLI (for testing)
 
 ## Installation
@@ -27,8 +27,8 @@ cargo build --release
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `PAN123_CLIENT_ID` | 123pan Open Platform client ID | (required) |
-| `PAN123_CLIENT_SECRET` | 123pan Open Platform client secret | (required) |
+| `PAN123_USERNAME` | 123pan username (phone/email) | (required) |
+| `PAN123_PASSWORD` | 123pan account password | (required) |
 | `PAN123_REPO_PATH` | Root folder path on 123pan | `/restic-backup` |
 | `LISTEN_ADDR` | Server listen address (host/IP) | `127.0.0.1` |
 | `LISTEN_PORT` | Server listen port | `8000` |
@@ -38,14 +38,14 @@ cargo build --release
 
 ```bash
 # Using environment variables
-export PAN123_CLIENT_ID=your_client_id
-export PAN123_CLIENT_SECRET=your_client_secret
+export PAN123_USERNAME=your_username
+export PAN123_PASSWORD=your_password
 cargo run --release
 
 # Or using command line arguments
 cargo run --release -- \
-  --client-id your_client_id \
-  --client-secret your_client_secret \
+  --username your_username \
+  --password your_password \
   --repo-path /my-restic-backup \
   --listen-addr 0.0.0.0 \
   --listen-port 8000
@@ -87,8 +87,8 @@ restic -r rest:http://127.0.0.1:8000/ restore latest --target /path/to/restore
 
 ```bash
 # Set credentials
-export PAN123_CLIENT_ID=your_client_id
-export PAN123_CLIENT_SECRET=your_client_secret
+export PAN123_USERNAME=your_username
+export PAN123_PASSWORD=your_password
 
 # Run all tests
 cargo test

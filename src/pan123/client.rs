@@ -1,15 +1,14 @@
 //! 123pan API client for file operations.
 
 use bytes::Bytes;
-use parking_lot::RwLock;
-use reqwest::multipart::{Form, Part};
-use std::sync::Arc;
+use base64::Engine;
+use reqwest::{Method, RequestBuilder, Url};
 
-use super::auth::{TokenManager, BASE_URL};
+use super::auth::{TokenManager, BAPI_BASE_URL};
 use super::entity;
 use super::types::{
-    ApiResponse, CreateDirData, CreateDirRequest, DeleteRequest, DownloadInfoData, FileInfo,
-    FileListData, MoveRequest, SingleUploadData, TrashRequest,
+    ApiResponse, DownloadInfoData, FileInfo, FileListData, S3AuthData, UploadCompleteV2Data,
+    UploadRequestData,
 };
 use super::{MAX_RETRIES, RETRY_DELAY};
 use crate::error::{AppError, Result};
@@ -29,11 +28,55 @@ pub struct Pan123Client {
     repo_path: String,
     /// Database connection for persistent cache
     pub(crate) db: DatabaseConnection,
-    /// Upload domain (fetched dynamically)
-    upload_domain: Arc<RwLock<Option<String>>>,
 }
 
 impl Pan123Client {
+    fn sign_web_url(&self, raw_url: &str) -> Result<String> {
+        const TABLE: &[u8; 26] = b"adefghlmyijnopkqrstubcvwsz";
+        let mut url =
+            Url::parse(raw_url).map_err(|e| AppError::Internal(format!("Invalid URL: {}", e)))?;
+
+        let now = chrono::Utc::now()
+            .with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).expect("valid CST offset"));
+        let timestamp = now.timestamp().to_string();
+        let random = (now.timestamp_subsec_micros() % 10_000_000).to_string();
+        let now_str = now.format("%Y%m%d%H%M").to_string();
+
+        let mut mapped = Vec::with_capacity(now_str.len());
+        for b in now_str.bytes() {
+            if !b.is_ascii_digit() {
+                return Err(AppError::Internal("Unexpected non-digit in time".to_string()));
+            }
+            mapped.push(TABLE[(b - b'0') as usize]);
+        }
+
+        let time_sign = crc32fast::hash(&mapped).to_string();
+        let sign_data = format!(
+            "{}|{}|{}|web|3|{}",
+            timestamp,
+            random,
+            url.path(),
+            time_sign
+        );
+        let data_sign = crc32fast::hash(sign_data.as_bytes()).to_string();
+        url.query_pairs_mut().append_pair(
+            &time_sign,
+            &format!("{}-{}-{}", timestamp, random, data_sign),
+        );
+
+        Ok(url.to_string())
+    }
+
+    fn apply_web_headers(&self, request: RequestBuilder, token: &str) -> RequestBuilder {
+        request
+            .header("authorization", format!("Bearer {}", token))
+            .header("origin", "https://www.123pan.com")
+            .header("referer", "https://www.123pan.com/")
+            .header("user-agent", "Mozilla/5.0 restic-123pan")
+            .header("platform", "web")
+            .header("app-version", "3")
+    }
+
     async fn retry_api<T, F, Fut>(&self, request_maker: F) -> Result<ApiResponse<T>>
     where
         T: serde::de::DeserializeOwned,
@@ -104,8 +147,8 @@ impl Pan123Client {
 
     /// Create a new 123pan client.
     pub async fn new(
-        client_id: String,
-        client_secret: String,
+        username: String,
+        password: String,
         repo_path: String,
         database_url: &str,
     ) -> Result<Self> {
@@ -129,10 +172,9 @@ impl Pan123Client {
         .map_err(|e| AppError::Internal(format!("Failed to set SQLite pragmas: {}", e)))?;
 
         let client = Self {
-            token_manager: TokenManager::new(client_id, client_secret, db.clone()),
+            token_manager: TokenManager::new(username, password, db.clone()),
             repo_path,
             db,
-            upload_domain: Arc::new(RwLock::new(None)),
         };
 
         client.init_db().await?;
@@ -190,10 +232,6 @@ impl Pan123Client {
         Ok(())
     }
 
-    async fn get<T: serde::de::DeserializeOwned>(&self, url: &str) -> Result<ApiResponse<T>> {
-        self.get_with_timeout::<T>(url, None).await
-    }
-
     async fn get_no_timeout<T: serde::de::DeserializeOwned>(
         &self,
         url: &str,
@@ -207,13 +245,10 @@ impl Pan123Client {
         url: &str,
         timeout: Option<std::time::Duration>,
     ) -> Result<ApiResponse<T>> {
+        let signed_url = self.sign_web_url(url)?;
         self.retry_api(|token| {
-            let mut request = self
-                .token_manager
-                .http_client()
-                .get(url)
-                .header("Authorization", format!("Bearer {}", token))
-                .header("Platform", "open_platform");
+            let mut request =
+                self.apply_web_headers(self.token_manager.http_client().get(&signed_url), token);
 
             if let Some(timeout) = timeout {
                 request = request.timeout(timeout);
@@ -229,75 +264,30 @@ impl Pan123Client {
         url: &str,
         body: &B,
     ) -> Result<ApiResponse<T>> {
+        self.post_with_method(Method::POST, url, body).await
+    }
+
+    async fn post_with_method<T: serde::de::DeserializeOwned, B: serde::Serialize>(
+        &self,
+        method: Method,
+        url: &str,
+        body: &B,
+    ) -> Result<ApiResponse<T>> {
         let body_json = serde_json::to_string(body)?;
+        let signed_url = self.sign_web_url(url)?;
 
         self.retry_api(|token| {
-            self.token_manager
-                .http_client()
-                .post(url)
-                .header("Authorization", format!("Bearer {}", token))
-                .header("Platform", "open_platform")
+            self.apply_web_headers(
+                self.token_manager
+                    .http_client()
+                    .request(method.clone(), &signed_url),
+                token,
+            )
                 .header("Content-Type", "application/json")
                 .body(body_json.clone())
                 .send()
         })
         .await
-    }
-
-    // ========================================================================
-    // Upload Domain
-    // ========================================================================
-
-    /// Get upload domain, fetching dynamically if not cached.
-    /// Includes 429 retry support.
-    async fn get_upload_domain(&self) -> Result<String> {
-        // Check cache first
-        {
-            let cache = self.upload_domain.read();
-            if let Some(domain) = cache.as_ref() {
-                return Ok(domain.clone());
-            }
-        }
-
-        // Fetch from API with 429 retry support
-        let url = format!("{}/upload/v2/file/domain", BASE_URL);
-
-        let api_response: ApiResponse<Vec<String>> = self
-            .retry_api(|token| {
-                self.token_manager
-                    .http_client()
-                    .get(&url)
-                    .header("Authorization", format!("Bearer {}", token))
-                    .header("Platform", "open_platform")
-                    .send()
-            })
-            .await?;
-
-        if !api_response.is_success() {
-            return Err(AppError::Pan123Api {
-                code: api_response.code,
-                message: api_response.message,
-            });
-        }
-
-        let domains = api_response
-            .data
-            .ok_or_else(|| AppError::Internal("No upload domain in response".to_string()))?;
-
-        let domain = domains
-            .into_iter()
-            .next()
-            .ok_or_else(|| AppError::Internal("Empty upload domain list".to_string()))?;
-
-        tracing::info!("Fetched upload domain: {}", domain);
-
-        // Cache the domain
-        {
-            let mut cache = self.upload_domain.write();
-            *cache = Some(domain.clone());
-        }
-
-        Ok(domain)
     }
 
     // ========================================================================
@@ -320,18 +310,14 @@ impl Pan123Client {
     /// Uses no timeout to handle large directories with hundreds of thousands of files.
     async fn fetch_files_from_api(&self, parent_id: i64) -> Result<Vec<FileInfo>> {
         let mut all_files = Vec::new();
-        let mut last_file_id: Option<i64> = None;
+        let mut page = 1;
         let mut page_count = 0;
 
         loop {
-            let mut url = format!(
-                "{}/api/v2/file/list?parentFileId={}&limit=100",
-                BASE_URL, parent_id
+            let url = format!(
+                "{}/file/list/new?driveId=0&limit=100&next=0&orderBy=file_id&orderDirection=desc&parentFileId={}&trashed=false&SearchData=&Page={}&OnlyLookAbnormalFile=0&event=homeListFile&operateType=4&inDirectSpace=false",
+                BAPI_BASE_URL, parent_id, page
             );
-
-            if let Some(id) = last_file_id {
-                url.push_str(&format!("&lastFileId={}", id));
-            }
 
             let response: ApiResponse<FileListData> = self.get_no_timeout(&url).await?;
 
@@ -365,7 +351,7 @@ impl Pan123Client {
                 if data.last_file_id == -1 {
                     break;
                 }
-                last_file_id = Some(data.last_file_id);
+                page += 1;
             } else {
                 break;
             }
@@ -386,15 +372,18 @@ impl Pan123Client {
     async fn create_directory(&self, parent_id: i64, name: &str) -> Result<i64> {
         tracing::debug!("Creating directory '{}' in parent {}", name, parent_id);
 
-        let request = CreateDirRequest {
-            name: name.to_string(),
-            parent_id,
-        };
+        let request = serde_json::json!({
+            "driveId": 0,
+            "etag": "",
+            "fileName": name,
+            "parentFileId": parent_id,
+            "size": 0,
+            "type": 1
+        });
 
-        // mkdir uses BASE_URL, not upload domain
-        let url = format!("{}/upload/v1/file/mkdir", BASE_URL);
+        let url = format!("{}/file/upload_request", BAPI_BASE_URL);
 
-        let response: ApiResponse<CreateDirData> = self.post(&url, &request).await?;
+        let response: ApiResponse<UploadRequestData> = self.post(&url, &request).await?;
 
         if !response.is_success() {
             tracing::debug!(
@@ -402,8 +391,8 @@ impl Pan123Client {
                 response.code,
                 response.message
             );
-            // Code 1: directory already exists (message: 该目录下已经有同名文件夹,无法进行创建)
-            if response.code == 1 {
+            // Old API returns non-zero for duplicate names.
+            if response.code != 0 {
                 if let Some(existing) = self.find_file(parent_id, name).await? {
                     if existing.is_folder() {
                         let cached = entity::Entity::find()
@@ -454,7 +443,7 @@ impl Pan123Client {
                         name: Set(f.filename.clone()),
                         is_dir: Set(f.is_folder()),
                         size: Set(f.size),
-                        etag: Set(None),
+                        etag: Set(f.etag.clone()),
                         updated_at: Set(chrono::Utc::now().naive_utc()),
                     })
                     .on_conflict(
@@ -490,13 +479,17 @@ impl Pan123Client {
             });
         }
 
-        let data = response
+        let upload_data = response
             .data
             .ok_or_else(|| AppError::Internal("No data in mkdir response".to_string()))?;
+        let info = upload_data
+            .info
+            .ok_or_else(|| AppError::Internal("No directory info in mkdir response".to_string()))?;
+        let dir_id = info.file_id;
 
         // Add newly created directory to DB
         let new_dir = entity::ActiveModel {
-            file_id: Set(data.dir_id),
+            file_id: Set(dir_id),
             parent_id: Set(parent_id),
             name: Set(name.to_string()),
             is_dir: Set(true),
@@ -508,8 +501,8 @@ impl Pan123Client {
             AppError::Internal(format!("Failed to insert new directory into DB: {}", e))
         })?;
 
-        tracing::info!("Created directory '{}' with id {}", name, data.dir_id);
-        Ok(data.dir_id)
+        tracing::info!("Created directory '{}' with id {}", name, dir_id);
+        Ok(dir_id)
     }
 
     /// Find directory ID for a path by traversing from root.
@@ -613,10 +606,8 @@ impl Pan123Client {
     // File Operations
     // ========================================================================
 
-    /// Upload a file using single-step upload (for files <= 1GB).
-    /// Uses duplicate=2 to overwrite existing files atomically.
-    /// Updates the persistent cache.
-    /// Includes 429 retry support.
+    /// Upload a file through the web-client API flow:
+    /// upload_request -> s3_upload_object/auth -> PUT -> upload_complete/v2.
     pub async fn upload_file(&self, parent_id: i64, filename: &str, data: Bytes) -> Result<i64> {
         let file_size = data.len() as i64;
         tracing::debug!(
@@ -626,37 +617,19 @@ impl Pan123Client {
             parent_id
         );
 
-        // Calculate MD5 hash
         let md5_hash = format!("{:x}", md5::compute(&data));
-
-        let upload_domain = self.get_upload_domain().await?;
-        let upload_url = format!("{}/upload/v2/file/single/create", upload_domain);
-
-        // Store data as Vec<u8> for reuse in retries
-        let data_vec = data.to_vec();
-
-        let api_response: ApiResponse<SingleUploadData> = self
-            .retry_api(|token| {
-                let form = Form::new()
-                    .text("parentFileID", parent_id.to_string())
-                    .text("filename", filename.to_string())
-                    .text("etag", md5_hash.clone())
-                    .text("size", file_size.to_string())
-                    .text("duplicate", "2")
-                    .part(
-                        "file",
-                        Part::bytes(data_vec.clone()).file_name(filename.to_string()),
-                    );
-
-                self.token_manager
-                    .http_client()
-                    .post(&upload_url)
-                    .header("Authorization", format!("Bearer {}", token))
-                    .header("Platform", "open_platform")
-                    .multipart(form)
-                    .send()
-            })
-            .await?;
+        let upload_req_url = format!("{}/file/upload_request", BAPI_BASE_URL);
+        let upload_req_body = serde_json::json!({
+            "driveId": 0,
+            "duplicate": 2,
+            "etag": md5_hash.clone(),
+            "fileName": filename,
+            "parentFileId": parent_id,
+            "size": file_size,
+            "type": 0
+        });
+        let api_response: ApiResponse<UploadRequestData> =
+            self.post(&upload_req_url, &upload_req_body).await?;
 
         if !api_response.is_success() {
             return Err(AppError::Pan123Api {
@@ -667,13 +640,84 @@ impl Pan123Client {
 
         let upload_data = api_response
             .data
-            .ok_or_else(|| AppError::Internal("No data in upload response".to_string()))?;
+            .ok_or_else(|| AppError::Internal("No data in upload request response".to_string()))?;
 
-        if !upload_data.completed {
-            return Err(AppError::Internal("Upload not completed".to_string()));
-        }
+        let file_id = if upload_data.reuse {
+            upload_data
+                .info
+                .as_ref()
+                .map(|f| f.file_id)
+                .or_else(|| {
+                    if upload_data.file_id > 0 {
+                        Some(upload_data.file_id)
+                    } else {
+                        None
+                    }
+                })
+                .ok_or_else(|| AppError::Internal("No file id in reuse upload response".to_string()))?
+        } else {
+            let s3_auth_url = format!("{}/file/s3_upload_object/auth", BAPI_BASE_URL);
+            let s3_auth_body = serde_json::json!({
+                "StorageNode": upload_data.storage_node,
+                "bucket": upload_data.bucket,
+                "key": upload_data.key,
+                "partNumberEnd": 1,
+                "partNumberStart": 1,
+                "uploadId": upload_data.upload_id
+            });
+            let s3_auth_response: ApiResponse<S3AuthData> =
+                self.post(&s3_auth_url, &s3_auth_body).await?;
+            if !s3_auth_response.is_success() {
+                return Err(AppError::Pan123Api {
+                    code: s3_auth_response.code,
+                    message: s3_auth_response.message,
+                });
+            }
+            let presigned_url = s3_auth_response
+                .data
+                .and_then(|d| d.presigned_urls.get("1").cloned())
+                .ok_or_else(|| AppError::Internal("No presigned URL for upload".to_string()))?;
 
-        let file_id = upload_data.file_id;
+            let upload_res = self
+                .token_manager
+                .http_client()
+                .put(&presigned_url)
+                .header("content-length", file_size.to_string())
+                .body(data.clone())
+                .send()
+                .await?;
+
+            if !upload_res.status().is_success() {
+                return Err(AppError::Internal(format!(
+                    "S3 upload failed with status {}",
+                    upload_res.status()
+                )));
+            }
+
+            let complete_url = format!("{}/file/upload_complete/v2", BAPI_BASE_URL);
+            let complete_body = serde_json::json!({
+                "StorageNode": upload_data.storage_node,
+                "bucket": upload_data.bucket,
+                "fileId": upload_data.file_id,
+                "fileSize": file_size,
+                "isMultipart": false,
+                "key": upload_data.key,
+                "uploadId": upload_data.upload_id
+            });
+            let complete_response: ApiResponse<UploadCompleteV2Data> =
+                self.post(&complete_url, &complete_body).await?;
+            if !complete_response.is_success() {
+                return Err(AppError::Pan123Api {
+                    code: complete_response.code,
+                    message: complete_response.message,
+                });
+            }
+            complete_response
+                .data
+                .ok_or_else(|| AppError::Internal("No data in upload complete response".to_string()))?
+                .file_info
+                .file_id
+        };
 
         // Sync with DB (insert or replace by parent/name)
         entity::Entity::insert(entity::ActiveModel {
@@ -710,8 +754,34 @@ impl Pan123Client {
 
     /// Get download URL for a file.
     pub async fn get_download_url(&self, file_id: i64) -> Result<String> {
-        let url = format!("{}/api/v1/file/download_info?fileId={}", BASE_URL, file_id);
-        let response: ApiResponse<DownloadInfoData> = self.get(&url).await?;
+        let node = entity::Entity::find_by_id(file_id)
+            .one(&self.db)
+            .await
+            .map_err(|e| AppError::Internal(format!("DB error in get_download_url: {}", e)))?
+            .ok_or_else(|| AppError::NotFound(format!("File {} not found in cache", file_id)))?;
+
+        let mut etag = node.etag.unwrap_or_default();
+        let mut s3_key_flag = String::new();
+
+        let remote = self.fetch_files_from_api(node.parent_id).await?;
+        if let Some(remote_file) = remote.into_iter().find(|f| f.file_id == file_id) {
+            if etag.is_empty() {
+                etag = remote_file.etag.unwrap_or_default();
+            }
+            s3_key_flag = remote_file.s3_key_flag.unwrap_or_default();
+        }
+
+        let body = serde_json::json!({
+            "driveId": 0,
+            "etag": etag,
+            "fileId": file_id,
+            "fileName": node.name,
+            "s3keyFlag": s3_key_flag,
+            "size": node.size,
+            "type": 0
+        });
+        let url = format!("{}/file/download_info", BAPI_BASE_URL);
+        let response: ApiResponse<DownloadInfoData> = self.post(&url, &body).await?;
 
         if !response.is_success() {
             if response.code == 5066 {
@@ -734,10 +804,62 @@ impl Pan123Client {
     /// Uses 123pan's native range download capability.
     pub async fn download_file(&self, file_id: i64, range: Option<(u64, u64)>) -> Result<Bytes> {
         let download_url = self.get_download_url(file_id).await?;
+        let mut resolved_url = download_url.clone();
 
-        let mut request = self.token_manager.http_client().get(&download_url);
+        if let Ok(url) = Url::parse(&download_url) {
+            if let Some(params) = url
+                .query_pairs()
+                .find(|(k, _)| k == "params")
+                .map(|(_, v)| v.into_owned())
+            {
+                if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(params) {
+                    if let Ok(real_url) = String::from_utf8(decoded) {
+                        resolved_url = real_url;
+                    }
+                }
+            }
+        }
 
-        // Pass Range header to 123pan for native range support
+        let mut probe_request = self
+            .token_manager
+            .http_client()
+            .get(&resolved_url)
+            .header("referer", "https://www.123pan.com/");
+        if let Some((start, end)) = range {
+            probe_request = probe_request.header("Range", format!("bytes={}-{}", start, end));
+        }
+
+        let probe = probe_request.send().await?;
+        let final_url = if probe.status().is_redirection() {
+            probe
+                .headers()
+                .get("location")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string())
+                .unwrap_or(resolved_url)
+        } else if probe.status().is_success() {
+            let text = probe.text().await?;
+            serde_json::from_str::<serde_json::Value>(&text)
+                .ok()
+                .and_then(|j| {
+                    j.get("data")
+                        .and_then(|d| d.get("redirect_url"))
+                        .and_then(|u| u.as_str())
+                        .map(|u| u.to_string())
+                })
+                .unwrap_or(resolved_url)
+        } else {
+            return Err(AppError::Internal(format!(
+                "Download probe failed with status: {}",
+                probe.status()
+            )));
+        };
+
+        let mut request = self
+            .token_manager
+            .http_client()
+            .get(&final_url)
+            .header("referer", "https://www.123pan.com/");
         if let Some((start, end)) = range {
             request = request.header("Range", format!("bytes={}-{}", start, end));
         }
@@ -757,12 +879,14 @@ impl Pan123Client {
     pub async fn trash_file(&self, file_id: i64) -> Result<()> {
         tracing::debug!("Moving file {} to trash", file_id);
 
-        let request = TrashRequest {
-            file_ids: vec![file_id],
-        };
+        let request = serde_json::json!({
+            "driveId": 0,
+            "operation": true,
+            "fileTrashInfoList": [{"FileId": file_id}]
+        });
 
-        let response: ApiResponse<()> = self
-            .post(&format!("{}/api/v1/file/trash", BASE_URL), &request)
+        let response: ApiResponse<serde_json::Value> = self
+            .post(&format!("{}/file/trash", BAPI_BASE_URL), &request)
             .await?;
 
         if !response.is_success() {
@@ -785,22 +909,8 @@ impl Pan123Client {
 
     /// Delete a file.
     pub async fn delete_file(&self, _parent_id: i64, file_id: i64) -> Result<()> {
-        // First move to trash (required by 123pan for permanent deletion)
+        // Web API handles deletion through trash API.
         self.trash_file(file_id).await?;
-
-        let url = format!("{}/api/v1/file/delete", BASE_URL);
-        let request = DeleteRequest {
-            file_ids: vec![file_id],
-        };
-
-        let response: ApiResponse<serde_json::Value> = self.post(&url, &request).await?;
-
-        if !response.is_success() {
-            return Err(AppError::Pan123Api {
-                code: response.code,
-                message: response.message,
-            });
-        }
 
         tracing::info!("Deleted file {} from persistent cache", file_id);
         Ok(())
@@ -815,13 +925,17 @@ impl Pan123Client {
 
         tracing::debug!("Moving {} files to parent {}", file_ids.len(), to_parent_id);
 
-        let request = MoveRequest {
-            file_ids: file_ids.clone(),
-            to_parent_file_id: to_parent_id,
-        };
+        let file_id_list: Vec<_> = file_ids
+            .iter()
+            .map(|id| serde_json::json!({ "FileId": id }))
+            .collect();
+        let request = serde_json::json!({
+            "fileIdList": file_id_list,
+            "parentFileId": to_parent_id
+        });
 
-        let response: ApiResponse<()> = self
-            .post(&format!("{}/api/v1/file/move", BASE_URL), &request)
+        let response: ApiResponse<serde_json::Value> = self
+            .post(&format!("{}/file/mod_pid", BAPI_BASE_URL), &request)
             .await?;
 
         if !response.is_success() {
@@ -1003,7 +1117,7 @@ impl Pan123Client {
                     name: Set(f.filename.clone()),
                     is_dir: Set(f.is_folder()),
                     size: Set(f.size),
-                    etag: Set(None),
+                    etag: Set(f.etag.clone()),
                     updated_at: Set(chrono::Utc::now().naive_utc()),
                 });
             }

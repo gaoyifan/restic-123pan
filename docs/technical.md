@@ -1,509 +1,226 @@
 # 技术文档：Restic REST API 123pan 后端实现
 
-本文档详细描述了 restic-123pan 项目中每个 Restic REST API 的实现逻辑，包括调用的 123pan API。
+本文档描述 `restic-123pan` 当前实现（普通客户端 API 方案）的整体设计、认证流程、接口映射、缓存与幂等性策略。
 
 ## 概述
 
-本服务器实现了 Restic REST API v2 协议，使用 123pan 开放平台 API 作为存储后端。服务器接收 Restic 客户端的标准 REST API 请求，并将其转换为相应的 123pan API 调用。
-
-## 架构
+`restic-123pan` 实现 Restic REST Backend v2，充当转换层：
 
 ```
-Restic CLI  <--REST API-->  本服务器  <--HTTPS-->  123pan 开放平台 API
+Restic CLI  <--REST API-->  本服务器  <--HTTPS-->  123pan 普通客户端接口
 ```
 
-## 123pan API 基础
+由于 123pan OpenAPI 权限关闭，服务端已从 OpenAPI 迁移到普通客户端接口。
+
+## 架构与模块
+
+- `src/restic/handler.rs`
+- `src/pan123/client.rs`
+- `src/pan123/auth.rs`
+- `src/pan123/types.rs`
+- `src/pan123/entity.rs`
+
+职责划分：
+
+1. `handler`：实现 Restic 协议语义（init/list/get/put/delete 等）。
+2. `client`：封装 123pan 接口调用与重试、上传下载流程、缓存同步。
+3. `auth`：负责登录、token 缓存、自动刷新。
+4. `entity`：SQLite 持久化文件元数据缓存。
+
+## 认证与签名（迁移重点）
 
 ### 认证
 
-所有 123pan API 调用都需要携带 OAuth 2.0 Bearer Token。服务器使用 `TokenManager` 管理访问令牌：
+当前使用账号密码登录：
 
-1. **获取令牌**：调用 `POST /api/v1/access_token`，传入 `clientID` 和 `clientSecret`
-2. **自动刷新**：令牌过期前 5 分钟自动刷新
-3. **线程安全**：使用 `RwLock` 确保并发访问安全
+- 接口：`POST https://login.123pan.com/api/user/sign_in`
+- 请求体：`passport`, `password`, `remember=true`
+- 成功码：`code=200`
+- 返回字段：`data.token`, `data.expire`
 
-### 上传域名
+实现细节：
 
-上传操作需要使用动态获取的上传域名：
+1. `TokenManager::get_token()` 先查内存 token。
+2. 内存无可用 token 时查 SQLite `token_cache`。
+3. 缓存不可用时触发 `sign_in`。
+4. 登录成功后写回内存 + SQLite。
+5. 过期前 5 分钟视为过期；登录刷新做 1 分钟限流，避免频繁请求 `sign_in`。
 
-1. **获取方式**：调用 `GET /upload/v2/file/domain`
-2. **缓存策略**：首次获取后缓存，避免重复请求
-3. **返回格式**：返回域名数组，使用第一个可用域名
+对应代码：
+
+- `src/pan123/auth.rs`
+
+### Web 客户端签名
+
+普通客户端 API 请求需要附加签名 query 参数（OpenList `drivers/123` 同款算法）。
+
+实现逻辑：
+
+1. 取北京时间（UTC+8）格式化 `yyyyMMddHHmm`。
+2. 数字按映射表 `adefghlmyijnopkqrstubcvwsz` 做字符替换。
+3. 对替换结果做 CRC32 得到 `timeSign`。
+4. 计算 `timestamp|random|path|web|3|timeSign` 的 CRC32 得到 `dataSign`。
+5. 追加 query：`{timeSign}={timestamp}-{random}-{dataSign}`。
+
+对应代码：
+
+- `Pan123Client::sign_web_url` in `src/pan123/client.rs`
+
+### 公共请求头
+
+所有业务请求统一设置：
+
+- `authorization: Bearer <token>`
+- `platform: web`
+- `app-version: 3`
+- `origin: https://www.123pan.com`
+- `referer: https://www.123pan.com/`
+- `user-agent: Mozilla/5.0 restic-123pan`
+
+## 123pan API 基础地址
+
+- 登录：`https://login.123pan.com/api/user/sign_in`
+- 业务：`https://www.123pan.com/b/api`
+
+## 接口映射（旧 OpenAPI -> 新普通客户端 API）
+
+| 功能 | 旧接口（OpenAPI） | 新接口（普通客户端） |
+|---|---|---|
+| 认证 | `POST /api/v1/access_token` | `POST https://login.123pan.com/api/user/sign_in` |
+| 列目录 | `GET /api/v2/file/list` | `GET /b/api/file/list/new` |
+| 建目录 | `POST /upload/v1/file/mkdir` | `POST /b/api/file/upload_request`（`type=1`） |
+| 上传（单步） | `POST /upload/v2/file/single/create` | `upload_request -> s3_upload_object/auth -> PUT -> upload_complete/v2` |
+| 下载信息 | `GET /api/v1/file/download_info` | `POST /b/api/file/download_info` |
+| 移动 | `POST /api/v1/file/move` | `POST /b/api/file/mod_pid` |
+| 删除到回收站 | `POST /api/v1/file/trash` | `POST /b/api/file/trash` |
+| 彻底删除 | `POST /api/v1/file/delete` | 当前不调用（只走 trash） |
 
 ## Restic API 实现详解
 
-### 1. 创建仓库 (POST /?create=true)
+### 1. 创建仓库 (`POST /?create=true`)
 
-**功能**：初始化 Restic 仓库目录结构
+初始化仓库目录结构：
 
-**实现逻辑**：
+- 根目录：`PAN123_REPO_PATH`
+- 子目录：`data`, `keys`, `locks`, `snapshots`, `index`
 
-1. 验证请求参数中包含 `create=true`
-2. 使用 123pan mkdir API 创建仓库根目录
-3. 创建以下子目录：
-   - `/data` - 存放数据块
-   - `/keys` - 存放加密密钥
-   - `/locks` - 存放锁文件
-   - `/snapshots` - 存放快照元数据
-   - `/index` - 存放索引文件
+目录创建统一使用：
 
-**调用的 123pan API**：
+- `POST /b/api/file/upload_request`
+- 参数：`type=1`, `fileName`, `parentFileId`, `driveId=0`
 
-- `POST /upload/v1/file/mkdir` - 创建目录
-  - 参数：`name`（目录名）, `parentID`（父目录 ID）
-  - 返回：`dirID`（新创建目录的 ID）
+若同名目录已存在，先读缓存/远端列表回填并复用。
 
-**特殊处理**：
+### 2. 删除仓库 (`DELETE /`)
 
-- 如果目录已存在（返回码 1），自动查找并返回现有目录 ID
-- 使用目录缓存避免重复查询
+当前仍未实现，返回 `501 Not Implemented`。
 
-### 2. 删除仓库 (DELETE /)
+### 3. 获取配置文件状态 (`HEAD /config`)
 
-**功能**：删除整个仓库
+- 通过仓库根目录缓存/列表定位 `config`。
+- 存在时返回 `200` 与 `Content-Length`，不存在返回 `404`。
 
-**实现状态**：未实现，返回 HTTP 501 Not Implemented
+### 4. 获取配置文件 (`GET /config`)
 
-### 3. 获取配置文件状态 (HEAD /config)
+- 在仓库根目录定位 `config` 文件。
+- 调 `download_info` 获取下载入口 URL。
+- 解析重定向后下载文件内容并返回。
 
-**功能**：检查配置文件是否存在
+### 5. 保存配置文件 (`POST /config`)
 
-**实现逻辑**：
+- 走统一上传链路（`upload_request -> s3 auth -> PUT -> upload_complete/v2`）。
+- `duplicate=2` 覆盖同名文件，满足 Restic 重试场景。
 
-1. 获取仓库根目录 ID
-2. 列出目录内容查找名为 `config` 的文件
-3. 如果找到，返回 HTTP 200 和 Content-Length 头
-4. 如果未找到，返回 HTTP 404
+### 6. 列出文件 (`GET /{type}/`)
 
-**调用的 123pan API**：
+- 通过 SQLite 查缓存。
+- 若缓存缺失/强制重建，调用 `file/list/new` 分页拉取并写回缓存。
+- `data` 类型按两级目录（前缀）聚合返回。
 
-- `GET /api/v2/file/list` - 列出目录内容
-  - 参数：`parentFileId`（父目录 ID）, `limit`（每页数量）
+### 7. 检查文件状态 (`HEAD /{type}/{name}`)
 
-### 4. 获取配置文件 (GET /config)
+- 在对应目录（或 `data/<prefix>`）查找目标文件。
+- 存在返回 `200`，不存在返回 `404`。
 
-**功能**：下载配置文件内容
+### 8. 下载文件 (`GET /{type}/{name}`)
 
-**实现逻辑**：
+- 先获取下载入口 URL，再解析重定向到真实下载 URL。
+- 支持并透传 `Range` 请求头。
 
-1. 获取仓库根目录 ID
-2. 查找配置文件获取其 file_id
-3. 获取配置文件的下载 URL
-4. 从 CDN 下载文件内容
-5. 返回文件内容
+### 9. 上传文件 (`POST /{type}/{name}`)
 
-**调用的 123pan API**：
+上传流程：
 
-- `GET /api/v2/file/list` - 查找文件
-- `GET /api/v1/file/download_info` - 获取下载 URL
-  - 参数：`fileId`（文件 ID）
-  - 返回：`downloadUrl`（CDN 下载地址）
+1. `upload_request(type=0, duplicate=2, etag=md5, size, parentFileId)`
+2. 若 `reuse=true`，直接拿 `FileId`。
+3. 否则调用 `s3_upload_object/auth` 获取预签名 URL。
+4. PUT 文件到预签名 URL。
+5. 调 `upload_complete/v2` 完成上传。
+6. 同步 SQLite（upsert by `parent_id + name`）。
 
-### 5. 保存配置文件 (POST /config)
+说明：
 
-**功能**：上传配置文件
+- 当前实现按单分片路径工作，满足 Restic 当前测试场景。
 
-**实现逻辑**：
+### 10. 删除文件 (`DELETE /{type}/{name}`)
 
-1. 获取仓库根目录 ID
-2. 使用单步上传 API 上传文件
-3. 使用 `duplicate=2` 参数实现原子覆盖（无需先删除旧文件）
+当前策略：
 
-**调用的 123pan API**：
+- 仅调用 `POST /b/api/file/trash`
+- 缓存同步删除
+- 文件不存在时对上层表现为幂等（返回成功）
 
-- `POST {upload_domain}/upload/v2/file/single/create` - 单步上传
-  - multipart 表单参数：
-    - `parentFileID` - 父目录 ID
-    - `filename` - 文件名
-    - `etag` - 文件 MD5 哈希
-    - `size` - 文件大小
-    - `duplicate` - 设为 2 表示覆盖已存在的同名文件
-    - `file` - 文件内容
+## SQLite 持久化缓存
 
-### 6. 列出文件 (GET /{type}/)
+缓存表：`file_nodes`（见 `src/pan123/entity.rs`）
 
-**功能**：列出指定类型的所有文件
+用途：
 
-**支持的类型**：`data`, `keys`, `locks`, `snapshots`, `index`
+1. 降低重复目录遍历 API 调用。
+2. 提供上传/删除后本地即时一致视图。
+3. 服务重启后可复用缓存，加速 warm-up。
 
-**实现逻辑**：
+缓存维护策略：
 
-1. 根据类型获取对应目录的 ID
-2. 使用分页方式列出目录下所有文件
-3. 过滤掉已删除的文件（trashed=1）
-4. 返回 v2 格式的文件列表（包含文件名和大小）
+- 启动 `warm_cache()`：按目录递归预热。
+- 上传成功：upsert 对应文件记录。
+- 删除成功：删除对应记录。
+- 强制重建：`FORCE_CACHE_REBUILD=true`。
 
-**调用的 123pan API**：
+## 错误与重试
 
-- `GET /api/v2/file/list` - 分页列出目录内容
-  - 参数：`parentFileId`, `limit`, `lastFileId`（分页游标）
+统一重试入口：`Pan123Client::retry_api`
 
-**响应格式**：
+- `429`：指数等待（受 `MAX_RETRIES`/`RETRY_DELAY` 控制）
+- `401`：触发 token refresh 后重试
+- 非成功 code：映射为 `AppError::Pan123Api`
 
-```json
-[
-  {"name": "abc123...", "size": 12345},
-  {"name": "def456...", "size": 67890}
-]
-```
+登录刷新同样具备限流与缓存回退，避免频繁调用 `sign_in`。
 
-### 7. 检查文件状态 (HEAD /{type}/{name})
+## 幂等性
 
-**功能**：检查指定文件是否存在
+- `GET/HEAD`：只读，天然幂等。
+- `POST /?create=true`：目录已存在可复用，幂等。
+- `POST /{type}/{name}`：`duplicate=2` 覆盖写，幂等。
+- `DELETE /{type}/{name}`：不存在时也返回成功语义，幂等。
 
-**实现逻辑**：
+## 配置
 
-1. 获取类型对应的目录 ID
-2. 列出目录内容查找指定文件
-3. 如果找到，返回 HTTP 200 和 Content-Length 头
-4. 如果未找到，返回 HTTP 404
+当前关键环境变量：
 
-**调用的 123pan API**：
+- `PAN123_USERNAME`
+- `PAN123_PASSWORD`
+- `PAN123_REPO_PATH`
+- `DB_PATH`
+- `FORCE_CACHE_REBUILD`
 
-- `GET /api/v2/file/list` - 列出目录内容
+## 验证状态
 
-### 8. 下载文件 (GET /{type}/{name})
+迁移后测试已覆盖：
 
-**功能**：下载指定文件，支持 Range 请求
+1. 单元测试
+2. 集成测试（缓存一致性、上传/删除/移动等）
+3. E2E（init/backup/restore）
+4. 大规模 E2E（100MB）
 
-**实现逻辑**：
-
-1. 获取类型对应的目录 ID
-2. 查找文件获取其 file_id
-3. 获取文件的下载 URL
-4. 如果请求包含 Range 头，将 Range 直接传递给 123pan CDN
-5. 下载并返回文件内容
-
-**调用的 123pan API**：
-
-- `GET /api/v2/file/list` - 查找文件
-- `GET /api/v1/file/download_info` - 获取下载 URL
-- GET 请求下载 URL（CDN）- 实际下载文件
-  - 支持原生 Range 请求
-
-**Range 请求处理**：
-
-- 解析 `Range: bytes=start-end` 头
-- 将 Range 头传递给 123pan CDN 实现原生范围下载
-- 返回 HTTP 206 Partial Content 和 Content-Range 头
-
-### 9. 上传文件 (POST /{type}/{name})
-
-**功能**：上传指定文件
-
-**实现逻辑**：
-
-1. 获取类型对应的目录 ID
-2. 计算文件 MD5 哈希
-3. 使用单步上传 API 上传文件
-4. 使用 `duplicate=2` 实现原子覆盖
-
-**调用的 123pan API**：
-
-- `POST {upload_domain}/upload/v2/file/single/create` - 单步上传
-
-**限制**：
-
-- 单步上传最大支持 1GB 文件
-- 大文件需要使用分片上传（当前未实现）
-
-### 10. 删除文件 (DELETE /{type}/{name})
-
-**功能**：删除指定文件（幂等操作）
-
-**实现逻辑**：
-
-1. 获取类型对应的目录 ID
-2. 查找文件获取其 file_id
-3. 如果文件不存在，直接返回 HTTP 200（幂等）
-4. 如果文件存在：
-   - 先将文件移至回收站
-   - 然后永久删除
-
-**调用的 123pan API**：
-
-- `GET /api/v2/file/list` - 查找文件
-- `POST /api/v1/file/trash` - 移至回收站
-  - 参数：`fileIDs`（文件 ID 数组）
-- `POST /api/v1/file/delete` - 永久删除
-  - 参数：`fileIDs`（文件 ID 数组）
-
-**注意**：123pan 要求先移至回收站后才能永久删除
-
-## 目录 ID 缓存
-
-为了减少 API 调用，服务器维护了一个目录路径到 ID 的缓存：
-
-- **缓存结构**：`HashMap<String, i64>`，使用 `RwLock` 保护
-- **查找时**：先检查缓存，命中则直接返回
-- **创建时**：将新目录的路径和 ID 加入缓存
-- **过期策略**：当前实现不过期，重启时清空
-
-## 错误处理
-
-### 123pan API 错误
-
-- **code=0**：成功
-- **code=1**：通用错误（如目录已存在时返回）
-- **code=429**：请求频率限制
-- **code=5066**：文件不存在
-
-### HTTP 状态码映射
-
-| 场景 | HTTP 状态码 |
-|------|-------------|
-| 成功 | 200 OK |
-| 部分内容（Range） | 206 Partial Content |
-| 参数错误 | 400 Bad Request |
-| 认证失败 | 401 Unauthorized |
-| 资源不存在 | 404 Not Found |
-| 123pan API 错误 | 502 Bad Gateway |
-| 功能未实现 | 501 Not Implemented |
-
-## 性能优化
-
-### 已实现
-
-1. **目录 ID 缓存**：减少重复的目录查询
-2. **上传域名缓存**：启动时获取一次，后续复用
-3. **连接池复用**：reqwest 自动管理 HTTP 连接池
-4. **原子覆盖**：使用 `duplicate=2` 避免删除后上传的两次 API 调用
-5. **原生 Range 下载**：将 Range 请求直接传递给 CDN，避免下载完整文件
-
-### 未来改进方向
-
-1. **分片上传**：支持大于 1GB 的文件
-2. **并行上传**：同时上传多个文件
-3. **预取目录列表**：预加载常用目录的文件列表
-
-## 日志
-
-服务器使用 `tracing` 库记录结构化日志：
-
-- **INFO**：关键操作（仓库初始化、文件上传/下载）
-- **DEBUG**：详细请求信息（API 调用、响应内容）
-- **ERROR**：错误信息（API 失败、解析错误）
-
-设置 `RUST_LOG=debug` 环境变量可启用详细日志。
-
-## 设计决策说明
-
-### 目录列表 vs 精确搜索
-
-最初计划使用 123pan 的 `searchMode=1` 参数进行精确文件名搜索以提高效率。但测试发现：
-
-1. 搜索索引存在延迟，新创建的文件可能无法立即搜索到
-2. `searchMode=1` 忽略 `parentFileId` 参数，返回全局搜索结果
-3. 这导致刚上传的文件无法被 Restic 立即找到
-
-因此改为使用目录列表方式查找文件，虽然可能稍慢但更可靠。
-
-### 幂等删除
-
-Restic 在某些情况下会尝试删除不存在的文件（如锁文件），因此删除操作实现为幂等的：
-- 文件存在时正常删除
-- 文件不存在时也返回 HTTP 200
-
-这避免了不必要的错误日志和重试。
-
-## 幂等性分析
-
-本章节分析每个 API 接口的幂等性，以及 123pan API 调用失败后重试是否能正确恢复。
-
-### 幂等性定义
-
-一个操作是**幂等**的，意味着执行一次和执行多次的效果相同。对于 REST API：
-- **GET/HEAD**：天然幂等（只读操作）
-- **PUT/DELETE**：应设计为幂等
-- **POST**：通常不幂等，但可以设计为幂等
-
-### 各接口幂等性分析
-
-#### 1. POST /?create=true（创建仓库）
-
-| 属性 | 说明 |
-|------|------|
-| **幂等性** | ✅ 幂等 |
-| **重试安全** | ✅ 安全 |
-
-**分析**：
-
-- `mkdir` API 在目录已存在时返回错误码 1
-- 服务器检测到此错误后，自动查找并返回现有目录 ID
-- 多次调用的最终状态相同：仓库目录结构已创建
-
-**失败场景与恢复**：
-
-| 失败点 | 状态 | 重试结果 |
-|--------|------|----------|
-| 根目录创建失败 | 无变化 | 重新创建，成功 |
-| 根目录创建成功，子目录创建失败 | 部分创建 | 已存在的目录被跳过，继续创建剩余目录 |
-| 所有目录创建成功，响应丢失 | 已完成 | 所有目录已存在，全部跳过，返回成功 |
-
-#### 2. HEAD /config（检查配置文件）
-
-| 属性 | 说明 |
-|------|------|
-| **幂等性** | ✅ 幂等（只读） |
-| **重试安全** | ✅ 安全 |
-
-**分析**：只读操作，不修改任何状态。
-
-#### 3. GET /config（获取配置文件）
-
-| 属性 | 说明 |
-|------|------|
-| **幂等性** | ✅ 幂等（只读） |
-| **重试安全** | ✅ 安全 |
-
-**分析**：只读操作，不修改任何状态。
-
-**失败场景与恢复**：
-
-| 失败点 | 状态 | 重试结果 |
-|--------|------|----------|
-| 获取目录列表失败 | 无变化 | 重试成功 |
-| 获取下载 URL 失败 | 无变化 | 重试成功 |
-| 下载过程中断 | 无变化 | 重试成功 |
-
-#### 4. POST /config（保存配置文件）
-
-| 属性 | 说明 |
-|------|------|
-| **幂等性** | ✅ 幂等 |
-| **重试安全** | ✅ 安全 |
-
-**分析**：
-
-- 使用 `duplicate=2` 参数实现原子覆盖
-- 相同内容多次上传，最终状态相同
-- 不同内容上传时，后者覆盖前者（符合预期语义）
-
-**失败场景与恢复**：
-
-| 失败点 | 状态 | 重试结果 |
-|--------|------|----------|
-| 上传请求发送失败 | 无变化 | 重试成功 |
-| 上传过程中断 | 可能部分上传（123pan 会丢弃） | 重试成功 |
-| 上传成功，响应丢失 | 已完成 | 重试上传，覆盖（内容相同），成功 |
-
-#### 5. GET /{type}/（列出文件）
-
-| 属性 | 说明 |
-|------|------|
-| **幂等性** | ✅ 幂等（只读） |
-| **重试安全** | ✅ 安全 |
-
-**分析**：只读操作，不修改任何状态。
-
-#### 6. HEAD /{type}/{name}（检查文件状态）
-
-| 属性 | 说明 |
-|------|------|
-| **幂等性** | ✅ 幂等（只读） |
-| **重试安全** | ✅ 安全 |
-
-**分析**：只读操作，不修改任何状态。
-
-#### 7. GET /{type}/{name}（下载文件）
-
-| 属性 | 说明 |
-|------|------|
-| **幂等性** | ✅ 幂等（只读） |
-| **重试安全** | ✅ 安全 |
-
-**分析**：只读操作，支持 Range 请求用于断点续传。
-
-**失败场景与恢复**：
-
-| 失败点 | 状态 | 重试结果 |
-|--------|------|----------|
-| 获取文件信息失败 | 无变化 | 重试成功 |
-| 获取下载 URL 失败 | 无变化 | 重试成功 |
-| 下载中断 | 无变化 | 可使用 Range 请求续传 |
-
-#### 8. POST /{type}/{name}（上传文件）
-
-| 属性 | 说明 |
-|------|------|
-| **幂等性** | ✅ 幂等 |
-| **重试安全** | ✅ 安全 |
-
-**分析**：
-
-- 使用 `duplicate=2` 参数实现原子覆盖
-- Restic 的文件名基于内容哈希，相同文件名意味着相同内容
-- 多次上传相同内容，最终状态相同
-
-**失败场景与恢复**：
-
-| 失败点 | 状态 | 重试结果 |
-|--------|------|----------|
-| 获取目录 ID 失败 | 无变化 | 重试成功 |
-| 上传请求发送失败 | 无变化 | 重试成功 |
-| 上传过程中断 | 文件未创建 | 重试成功 |
-| 上传成功，响应丢失 | 已完成 | 重试上传，覆盖（内容相同），成功 |
-
-**特殊说明**：
-
-Restic 的 data 目录中的文件名是内容寻址的（content-addressed），即文件名是内容的哈希值。这意味着：
-- 相同文件名 = 相同内容
-- 重复上传不会造成数据不一致
-
-#### 9. DELETE /{type}/{name}（删除文件）
-
-| 属性 | 说明 |
-|------|------|
-| **幂等性** | ✅ 幂等 |
-| **重试安全** | ✅ 安全 |
-
-**分析**：
-
-- 文件不存在时直接返回 HTTP 200（幂等设计）
-- 删除是两步操作：先 trash 后 delete
-- 两步之间失败不会导致数据不一致
-
-**失败场景与恢复**：
-
-| 失败点 | 状态 | 重试结果 |
-|--------|------|----------|
-| 获取文件信息失败 | 无变化 | 重试成功 |
-| 文件不存在 | 无变化 | 返回成功（幂等） |
-| trash 失败 | 文件仍存在 | 重试 trash，成功 |
-| trash 成功，delete 失败 | 文件在回收站 | 重试时 find_file 找不到文件（已不在原目录），返回成功 |
-| delete 成功，响应丢失 | 已删除 | 重试时文件不存在，返回成功 |
-
-**潜在问题**：
-
-`trash 成功，delete 失败` 的场景会在回收站中留下残留文件。但这不影响 Restic 的正常运行：
-- 文件已从原目录移除，不会被 Restic 发现
-- 回收站中的文件不占用用户空间配额（123pan 策略）
-- 用户可手动清理回收站
-
-### 123pan API 失败类型
-
-| 错误类型 | 错误码 | 重试建议 |
-|----------|--------|----------|
-| 请求频率限制 | 429 | 等待后重试 |
-| 网络超时 | - | 立即重试 |
-| 服务器错误 | 5xx | 等待后重试 |
-| 认证过期 | 401 | 刷新 token 后重试 |
-| 文件不存在 | 5066 | 不重试（预期错误） |
-| 目录已存在 | 1 | 不重试（已处理） |
-
-### 总结
-
-| 接口 | 幂等性 | 重试安全 | 备注 |
-|------|--------|----------|------|
-| POST /?create=true | ✅ | ✅ | 已存在的目录被跳过 |
-| DELETE / | - | - | 未实现 |
-| HEAD /config | ✅ | ✅ | 只读 |
-| GET /config | ✅ | ✅ | 只读 |
-| POST /config | ✅ | ✅ | duplicate=2 原子覆盖 |
-| GET /{type}/ | ✅ | ✅ | 只读 |
-| HEAD /{type}/{name} | ✅ | ✅ | 只读 |
-| GET /{type}/{name} | ✅ | ✅ | 只读，支持 Range |
-| POST /{type}/{name} | ✅ | ✅ | duplicate=2 原子覆盖 |
-| DELETE /{type}/{name} | ✅ | ✅ | 不存在时返回 200 |
-
-**结论**：所有已实现的接口都是幂等的，可以安全地进行重试。这确保了在网络不稳定或 123pan API 临时故障的情况下，Restic 客户端可以通过重试恢复操作。
+结论：在普通客户端 API 方案下，当前实现可稳定支撑 Restic v2 备份与恢复流程。

@@ -1,4 +1,4 @@
-//! Token management for 123pan API authentication.
+//! Token management for 123pan web API authentication.
 
 use chrono::{DateTime, Duration, Utc};
 use parking_lot::RwLock;
@@ -9,12 +9,14 @@ use sea_orm::{
 };
 use std::sync::Arc;
 
-use super::types::{AccessTokenData, AccessTokenRequest, ApiResponse};
+use super::types::{SignInRequest, SignInResponse};
 use super::{MAX_RETRIES, RETRY_DELAY};
 use crate::error::{AppError, Result};
 
-/// Base URL for 123pan Open Platform API.
-pub const BASE_URL: &str = "https://open-api.123pan.com";
+/// Base URL for 123pan web APIs.
+pub const BASE_URL: &str = "https://www.123pan.com";
+pub const BAPI_BASE_URL: &str = "https://www.123pan.com/b/api";
+pub const LOGIN_URL: &str = "https://login.123pan.com/api/user/sign_in";
 
 /// Token with expiry information.
 #[derive(Debug, Clone)]
@@ -30,11 +32,11 @@ impl TokenInfo {
     }
 }
 
-/// Token manager that handles automatic token refresh.
+/// Token manager that handles automatic sign-in and token caching.
 #[derive(Clone)]
 pub struct TokenManager {
-    client_id: String,
-    client_secret: String,
+    username: String,
+    password: String,
     http_client: Client,
     db: DatabaseConnection,
     token: Arc<RwLock<Option<TokenInfo>>>,
@@ -48,15 +50,15 @@ const TOKEN_CACHE_EXPIRES_AT: &str = "expires_at";
 
 impl TokenManager {
     /// Create a new token manager.
-    pub fn new(client_id: String, client_secret: String, db: DatabaseConnection) -> Self {
+    pub fn new(username: String, password: String, db: DatabaseConnection) -> Self {
         let http_client = Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .expect("Failed to create HTTP client");
 
         Self {
-            client_id,
-            client_secret,
+            username,
+            password,
             http_client,
             db,
             token: Arc::new(RwLock::new(None)),
@@ -89,7 +91,6 @@ impl TokenManager {
 
     /// Get a valid access token, refreshing if necessary.
     pub async fn get_token(&self) -> Result<String> {
-        // Check if we have a valid token
         {
             let token_guard = self.token.read();
             if let Some(ref token_info) = *token_guard {
@@ -99,122 +100,88 @@ impl TokenManager {
             }
         }
 
-        // Check cached token in DB
         if let Some(token_info) = self.load_cached_token().await? {
             let mut token_guard = self.token.write();
             *token_guard = Some(token_info.clone());
             return Ok(token_info.access_token);
         }
 
-        // Need to refresh token
         self.refresh_token().await
     }
 
-    /// Force refresh the access token.
-    /// Includes 429 retry support.
-    /// Rate limited to once per minute.
+    /// Force refresh token by sign-in.
+    /// Rate limited to once per minute to avoid frequent sign-in.
     pub async fn refresh_token(&self) -> Result<String> {
-        // Rate limit check
         {
             let last_refresh = self.last_refresh_time.read();
             if let Some(last_time) = *last_refresh {
                 let now = Utc::now();
                 if now - last_time < Duration::minutes(1) {
-                    tracing::warn!(
-                        "Token refresh rate limited (last refresh: {}), returning cached token if available",
-                        last_time
-                    );
-                    // Try to return existing token even if potentially expired,
-                    // or just return what we have to avoid spamming API.
-                    // Ideally we should check if we really have a token.
                     let token_guard = self.token.read();
                     if let Some(ref token_info) = *token_guard {
                         return Ok(token_info.access_token.clone());
                     }
-                    // If we don't have a token and we are rate limited, we might just have to error
-                    // or wait. For now, returning error to signal we can't refresh yet is safer
-                    // than spamming, but might cause downstream failures.
-                    // Let's decide to return early.
                     return Err(AppError::Auth("Token refresh rate limited".to_string()));
                 }
             }
         }
 
-        tracing::info!("Refreshing 123pan access token");
+        tracing::info!("Refreshing 123pan access token via sign-in");
 
-        let url = format!("{}/api/v1/access_token", BASE_URL);
-
-        let request = AccessTokenRequest {
-            client_id: self.client_id.clone(),
-            client_secret: self.client_secret.clone(),
-        };
-
-        // Serialize request once for reuse in retries
-        let request_json = serde_json::to_string(&request).map_err(|e| {
-            AppError::Auth(format!("Failed to serialize access token request: {}", e))
-        })?;
+        let request_json = serde_json::to_string(&SignInRequest {
+            passport: self.username.clone(),
+            password: self.password.clone(),
+            remember: true,
+        })
+        .map_err(|e| AppError::Auth(format!("Failed to serialize sign-in request: {}", e)))?;
 
         for attempt in 0..=MAX_RETRIES {
             let response = self
                 .http_client
-                .post(&url)
-                .header("Platform", "open_platform")
-                .header("Content-Type", "application/json")
+                .post(LOGIN_URL)
+                .header("origin", "https://www.123pan.com")
+                .header("referer", "https://www.123pan.com/")
+                .header("user-agent", "Mozilla/5.0 restic-123pan")
+                .header("platform", "web")
+                .header("app-version", "3")
+                .header("content-type", "application/json")
                 .body(request_json.clone())
                 .send()
                 .await?;
 
-            let api_response: ApiResponse<AccessTokenData> = response.json().await?;
+            let sign_in_response: SignInResponse = response.json().await?;
 
-            // Check for 429 rate limit error
-            if api_response.code == 429 {
+            if sign_in_response.code == 429 {
                 if attempt < MAX_RETRIES {
-                    tracing::warn!(
-                        "Rate limited (429) when refreshing access token, waiting {}s before retry (attempt {}/{})",
-                        RETRY_DELAY.as_secs(),
-                        attempt + 1,
-                        MAX_RETRIES
-                    );
                     tokio::time::sleep(RETRY_DELAY).await;
                     continue;
-                } else {
-                    tracing::error!(
-                        "Rate limited (429) after {} retries when refreshing access token, giving up",
-                        MAX_RETRIES
-                    );
-                    return Err(AppError::Auth(format!(
-                        "Failed to get access token after retries: {} (code: {})",
-                        api_response.message, api_response.code
-                    )));
                 }
-            }
-
-            if !api_response.is_success() {
                 return Err(AppError::Auth(format!(
-                    "Failed to get access token: {} (code: {})",
-                    api_response.message, api_response.code
+                    "Failed to sign in after retries: {} (code: {})",
+                    sign_in_response.message, sign_in_response.code
                 )));
             }
 
-            let data = api_response
-                .data
-                .ok_or_else(|| AppError::Auth("No data in access token response".to_string()))?;
+            if sign_in_response.code != 200 {
+                return Err(AppError::Auth(format!(
+                    "Failed to sign in: {} (code: {})",
+                    sign_in_response.message, sign_in_response.code
+                )));
+            }
 
-            // Parse expiry time
-            let expires_at = DateTime::parse_from_rfc3339(&data.expired_at)
+            let data = sign_in_response
+                .data
+                .ok_or_else(|| AppError::Auth("No data in sign-in response".to_string()))?;
+
+            let expires_at = DateTime::parse_from_rfc3339(&data.expire)
                 .map(|dt| dt.with_timezone(&Utc))
-                .unwrap_or_else(|_| {
-                    // Default to 1 hour from now if parsing fails
-                    tracing::warn!("Failed to parse token expiry time, defaulting to 1 hour");
-                    Utc::now() + Duration::hours(1)
-                });
+                .unwrap_or_else(|_| Utc::now() + Duration::days(90));
 
             let token_info = TokenInfo {
-                access_token: data.access_token.clone(),
+                access_token: data.token.clone(),
                 expires_at,
             };
 
-            // Update stored token
             {
                 let mut token_guard = self.token.write();
                 *token_guard = Some(token_info.clone());
@@ -222,18 +189,12 @@ impl TokenManager {
 
             self.store_cached_token(&token_info).await?;
 
-            tracing::info!(
-                "Successfully refreshed access token, expires at {}",
-                expires_at
-            );
-
-            // Update last refresh time
             {
                 let mut last_refresh = self.last_refresh_time.write();
                 *last_refresh = Some(Utc::now());
             }
 
-            return Ok(data.access_token);
+            return Ok(data.token);
         }
 
         unreachable!()
@@ -271,10 +232,7 @@ impl TokenManager {
 
         let expires_at = match DateTime::parse_from_rfc3339(&expires_at_str) {
             Ok(dt) => dt.with_timezone(&Utc),
-            Err(_) => {
-                tracing::warn!("Cached token expiry parse failed, ignoring cache");
-                return Ok(None);
-            }
+            Err(_) => return Ok(None),
         };
 
         let token_info = TokenInfo {
@@ -322,8 +280,8 @@ impl TokenManager {
 impl std::fmt::Debug for TokenManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TokenManager")
-            .field("client_id", &self.client_id)
-            .field("client_secret", &"[REDACTED]")
+            .field("username", &self.username)
+            .field("password", &"[REDACTED]")
             .finish()
     }
 }

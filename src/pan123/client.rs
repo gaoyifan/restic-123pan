@@ -70,8 +70,8 @@ impl Pan123Client {
     fn apply_web_headers(&self, request: RequestBuilder, token: &str) -> RequestBuilder {
         request
             .header("authorization", format!("Bearer {}", token))
-            .header("origin", "https://www.123pan.com")
-            .header("referer", "https://www.123pan.com/")
+            .header("origin", super::auth::BASE_URL)
+            .header("referer", format!("{}/", super::auth::BASE_URL))
             .header("user-agent", "Mozilla/5.0 restic-123pan")
             .header("platform", "web")
             .header("app-version", "3")
@@ -828,7 +828,7 @@ impl Pan123Client {
             .map_err(|e| AppError::Internal(format!("Failed to build probe client: {}", e)))?;
         let probe = probe_client
             .get(&resolved_url)
-            .header("referer", "https://www.123pan.com/")
+            .header("referer", format!("{}/", super::auth::BASE_URL))
             .header("Range", "bytes=0-0")
             .send()
             .await?;

@@ -14,8 +14,8 @@ use super::{MAX_RETRIES, RETRY_DELAY};
 use crate::error::{AppError, Result};
 
 /// Base URL for 123pan web APIs.
-pub const BASE_URL: &str = "https://www.123pan.com";
-pub const BAPI_BASE_URL: &str = "https://www.123pan.com/b/api";
+pub const BASE_URL: &str = "https://yun.123pan.com";
+pub const BAPI_BASE_URL: &str = "https://yun.123pan.com/b/api";
 pub const LOGIN_URL: &str = "https://login.123pan.com/api/user/sign_in";
 
 /// Token with expiry information.
@@ -139,8 +139,8 @@ impl TokenManager {
             let response = self
                 .http_client
                 .post(LOGIN_URL)
-                .header("origin", "https://www.123pan.com")
-                .header("referer", "https://www.123pan.com/")
+                .header("origin", BASE_URL)
+                .header("referer", format!("{}/", BASE_URL))
                 .header("user-agent", "Mozilla/5.0 restic-123pan")
                 .header("platform", "web")
                 .header("app-version", "3")
@@ -283,5 +283,16 @@ impl std::fmt::Debug for TokenManager {
             .field("username", &self.username)
             .field("password", &"[REDACTED]")
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BAPI_BASE_URL, BASE_URL};
+
+    #[test]
+    fn uses_current_123pan_web_api_host() {
+        assert_eq!(BASE_URL, "https://yun.123pan.com");
+        assert_eq!(BAPI_BASE_URL, "https://yun.123pan.com/b/api");
     }
 }

@@ -16,8 +16,7 @@ in {
     };
 
     environmentFile = lib.mkOption {
-      type = lib.types.nullOr lib.types.str;
-      default = null;
+      type = lib.types.externalPath;
       description = "Environment file containing the 123pan credentials.";
     };
 
@@ -62,35 +61,22 @@ in {
       default = "root";
       description = "Group running restic-123pan.";
     };
-
-    wantedBy = lib.mkOption {
-      type = lib.types.listOf lib.types.str;
-      default = ["multi-user.target"];
-      description = "Systemd targets that should start restic-123pan.";
-    };
   };
 
   config = lib.mkIf cfg.enable {
-    assertions = [
-      {
-        assertion = cfg.environmentFile != null;
-        message = "services.restic-123pan.environmentFile must be set when enabled.";
-      }
-    ];
-
     systemd.tmpfiles.rules = [
       "d ${cfg.cacheDirectory} 0750 ${cfg.user} ${cfg.group} -"
     ];
 
     systemd.services.restic-123pan = {
       description = "Restic REST backend for 123pan cloud storage";
-      wantedBy = cfg.wantedBy;
+      wantedBy = lib.mkDefault ["multi-user.target"];
       after = ["network-online.target"];
       wants = ["network-online.target"];
       unitConfig.RequiresMountsFor = [cfg.cacheDirectory];
       serviceConfig = {
         ExecStart = lib.getExe cfg.package;
-        EnvironmentFile = lib.optional (cfg.environmentFile != null) cfg.environmentFile;
+        EnvironmentFile = cfg.environmentFile;
         User = cfg.user;
         Group = cfg.group;
         Restart = "on-failure";

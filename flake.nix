@@ -22,7 +22,7 @@
         version = "0.3.1";
         src = ./.;
 
-        cargoHash = "sha256-uVjvjuwknBnvux+Cm3jxS/KD90Eed6bD1q/zQTjgrgU=";
+        cargoHash = "sha256-TkBjlW1MCZqb9ZsP/L+WVHjoAAhT3IW2gO0+yEEgW84=";
         nativeBuildInputs = [
           pkgs.perl
           pkgs.pkg-config

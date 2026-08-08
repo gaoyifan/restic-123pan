@@ -15,7 +15,8 @@ use restic_123pan::restic::create_router;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Parse configuration
-    let config = Config::parse();
+    let config = Config::parse().load_credentials()?;
+    let (username, password) = config.clone().credentials()?;
 
     // Initialize logging
     tracing_subscriber::registry()
@@ -45,8 +46,8 @@ async fn main() -> anyhow::Result<()> {
 
     // Create 123pan client
     let client = Pan123Client::new(
-        config.username.clone(),
-        config.password.clone(),
+        username,
+        password,
         config.repo_path.clone(),
         &database_url,
     )

@@ -36,6 +36,11 @@ cargo build --release
 
 ### Running the Server
 
+The NixOS module uses systemd credentials instead of `EnvironmentFile`. Set
+`services.restic-123pan.instances.<name>.usernameFile` and `passwordFile`;
+the module loads them into the service's private credential directory and
+passes their paths to the server.
+
 ```bash
 # Using environment variables
 export PAN123_USERNAME=your_username
